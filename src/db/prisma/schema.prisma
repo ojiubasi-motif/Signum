@@ -1,0 +1,70 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Admin {
+  id            String    @id  // WhatsApp number
+  name          String
+  signals       Signal[]
+  winRate       Float     @default(0)
+  totalSignals  Int       @default(0)
+  totalWins     Int       @default(0)
+}
+
+model Signal {
+  id              String    @id @default(cuid())
+  adminId         String
+  asset           String                // ETH, BTC
+  direction       String                // BUY, SELL
+  entryMin        Float
+  entryMax        Float
+  tpPercent       Float
+  slPercent       Float
+  tpPrice         Float                 // calculated
+  slPrice         Float                 // calculated
+  rrRatio         Float                 // calculated
+  urgencyScore    Int       @default(0)
+  status          SignalStatus @default(PENDING)
+  rawText         String                // original admin message
+  enrichment      Json?                 // Claude's enrichment output
+  livePriceAtPost Float?                // price when signal was posted
+  resolvedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  admin           Admin     @relation(fields:[adminId], references:[id])
+  memberTrades    MemberTrade[]
+}
+
+model Member {
+  id              String    @id @default(cuid())
+  whatsappNumber  String    @unique
+  alertsEnabled   Boolean   @default(true)
+  fcmToken        String?
+  joinedAt        DateTime  @default(now())
+  trades          MemberTrade[]
+}
+
+model MemberTrade {
+  id        String   @id @default(cuid())
+  memberId  String
+  signalId  String
+  takenAt   DateTime @default(now())
+  outcome   String?  // WIN, LOSS, MISSED
+
+  member    Member   @relation(fields:[memberId], references:[id])
+  signal    Signal   @relation(fields:[signalId], references:[id])
+}
+
+enum SignalStatus {
+  PENDING         // just received, being processed
+  ENTRY_OPEN      // price inside entry zone
+  ENTRY_MISSED    // price moved past entry zone
+  TP_HIT          // take profit reached
+  SL_HIT          // stop loss hit
+  EXPIRED         // manually cancelled or timed out
+}
