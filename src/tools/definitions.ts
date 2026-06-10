@@ -27,7 +27,8 @@ export const tools: any[] = [
         rrRatio: { type: 'number', description: 'The calculated risk-reward ratio' },
         urgencyScore: { type: 'number', minimum: 1, maximum: 10, description: 'The urgency score between 1 and 10 based on distance to entry zone' },
         adminId: { type: 'string', description: 'The admin sender phone number or LID JID' },
-        rawText: { type: 'string', description: 'The original raw message text' }
+        rawText: { type: 'string', description: 'The original raw message text' },
+        messageId: { type: 'string', description: 'The unique WhatsApp message ID associated with this signal' }
       },
       required: [
         'asset', 'direction', 'entryMin', 'entryMax',
@@ -62,6 +63,25 @@ export const tools: any[] = [
         }
       },
       required: ['signalId', 'status']
+    }
+  },
+  {
+    name: 'adjust_signal',
+    description: 'Adjust or update the trading parameters (entry zone, TP, SL, or R:R) of an existing active signal in the database',
+    input_schema: {
+      type: 'object',
+      properties: {
+        signalId: { type: 'string', description: 'The unique database ID of the signal to adjust' },
+        entryMin: { type: 'number', description: 'The adjusted minimum entry price limit' },
+        entryMax: { type: 'number', description: 'The adjusted maximum entry price limit' },
+        tpPercent: { type: 'number', description: 'The adjusted take profit target percentage' },
+        slPercent: { type: 'number', description: 'The adjusted stop loss target percentage' },
+        tpPrice: { type: 'number', description: 'The adjusted take profit target price' },
+        slPrice: { type: 'number', description: 'The adjusted stop loss target price' },
+        rrRatio: { type: 'number', description: 'The adjusted risk-reward ratio' },
+        rawText: { type: 'string', description: 'The raw update/adjustment text from the admin' }
+      },
+      required: ['signalId']
     }
   }
 ];

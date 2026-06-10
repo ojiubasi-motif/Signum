@@ -1,6 +1,7 @@
 import Groq from 'groq-sdk';
 import { tools as anthropicTools } from '../tools/definitions';
 import { executeTool } from '../tools/executor';
+import { callAIWithFallback } from './providers';
 
 let clientInstance: Groq | null = null;
 
@@ -19,27 +20,42 @@ const AGENT_SYSTEM_PROMPT = `
 You are Signum, an autonomous AI agent that processes crypto trading signals from WhatsApp.
 
 Your job for every message:
-1. Determine if the message is a trading signal, signal update, signal cancellation, or noise.
-2. If it's a signal — extract all trading data precisely (asset, direction, entryMin, entryMax, tpPercent, slPercent).
-3. Get the live price for the asset using the \`get_live_price\` tool.
-4. Calculate and output the TP price, SL price, and Risk-Reward (R:R) ratio using the following exact formulas:
-   - For BUY signals:
-     * tpPrice = entryMax * (1 + tpPercent / 100)
-     * slPrice = entryMin * (1 - slPercent / 100)
-   - For SELL signals:
-     * tpPrice = entryMin * (1 - tpPercent / 100)
-     * slPrice = entryMax * (1 + slPercent / 100)
-   - Risk-Reward Ratio:
-     * rrRatio = tpPercent / slPercent (rounded to 2 decimal places)
-5. Assess the urgencyScore (integer between 1 and 10) based on how close the live price is to the entry zone:
-   - If the live price is inside the entry zone [entryMin, entryMax], urgencyScore = 10.
-   - If the live price has moved past the entry zone in the direction of the trade, urgencyScore = 1.
-   - Otherwise, calculate proximity (urgencyScore = Math.max(1, Math.min(9, 10 - Math.round(Math.abs(livePrice - entryMin) / entryMin * 100)))).
-6. Save the signal to the database using the \`save_signal\` tool. You MUST calculate and include all required parameters: 'asset', 'direction', 'entryMin', 'entryMax', 'tpPercent', 'slPercent', 'tpPrice', 'slPrice', 'rrRatio', 'urgencyScore', 'adminId', 'rawText'.
-7. Notify members with a clear, human-friendly alert using the \`notify_members\` tool.
+1. Determine if the message is a new trading signal, a signal adjustment/update, a signal cancellation/deletion, or noise.
+2. If it's a new signal or a signal adjustment/update:
+   - Identify the asset, direction (BUY/SELL), entryMin, and entryMax.
+   - Look for target (TP) and stoploss (SL). They can be specified either as percentages (e.g. "Target: 10%") or as absolute prices (e.g. "Target: 63780").
+   - Compute all four metrics as raw numbers: tpPrice, slPrice, tpPercent, slPercent.
+     * Note: You MUST perform the math calculations yourself and output only the final calculated numbers. Do not put mathematical formulas or equations into tool parameters.
+     * BUY formulas:
+       - tpPrice = entryMax * (1 + tpPercent / 100)  (or back-calculate tpPercent = ((tpPrice / entryMax) - 1) * 100)
+       - slPrice = entryMin * (1 - slPercent / 100)  (or back-calculate slPercent = (1 - (slPrice / entryMin)) * 100)
+     * SELL formulas:
+       - tpPrice = entryMin * (1 - tpPercent / 100)  (or back-calculate tpPercent = (1 - (tpPrice / entryMin)) * 100)
+       - slPrice = entryMax * (1 + slPercent / 100)  (or back-calculate slPercent = ((slPrice / entryMax) - 1) * 100)
+     * Risk-Reward Ratio (rrRatio):
+       - rrRatio = tpPercent / slPercent (rounded to 2 decimal places)
+   - Fetch the current asset price and compute the urgencyScore (1 to 10) based on proximity to the entry zone.
+
+3. Learn and process natural language instructions adjusting open signals:
+   - Identify which active signal to adjust:
+     * If the admin mentions a specific coin/token (e.g., "BTC", "C"), adjust ONLY the active signal for that coin/token in the "Current open signals" list.
+     * If the admin does NOT specify any coin/token, assume they are referring to the last signal given (the most recently created signal in "Current open signals").
+     * A signal is still considered active if it is in the "Current open signals" list (status is ENTRY_OPEN, meaning it has not hit SL).
+   - "take stoploss to max entry" or "make trade breakeven" means:
+     * For BUY signals, set slPrice = entryMax and calculate the numerical slPercent = (1 - (slPrice / entryMin)) * 100.
+     * For SELL signals, set slPrice = entryMin and calculate the numerical slPercent = ((slPrice / entryMax) - 1) * 100.
+   - "leave SL open" or "no stoploss" (means remove/unset stop loss. Represent this by setting slPrice = 0 and slPercent = 0).
+    - "close [coin/token] trade" means sell the coin/token at current price (update its status to EXPIRED in the database, and stop tracking/watching it).
+    - "switch [coin/token] for {new signal}" means sell the coin/token (update its status to EXPIRED in the database, stop tracking/watching it) and take the {new signal} instead (parse the new signal and save it as a new signal in the database).
+    - Dynamically parse and adapt to any other conversational instruction from the admin adjusting active open signals.
+
+4. Route the actions to the appropriate tools (Always output computed numbers, never math equations!):
+   - For a NEW signal: save the signal to the database. If the save_signal tool returns pendingCoingecko: true in its response, you MUST NOT call notify_members. Instead, finish the run and explain that multiple coin candidates were found and you have prompted the admin in their DM to select the correct one. If pendingCoingecko is false (or not returned), proceed to notify members with a clean, friendly alert.
+   - For a signal ADJUSTMENT/UPDATE: find the active signal in the provided "Current open signals" list for that asset. Adjust the signal with the updated values (and the signalId), then notify the members to alert them of the adjustment (e.g. "⚠️ BTC Signal Adjusted...").
+   - For a signal CANCELLATION/DELETION (e.g. "cancel BTC", "delete BTC", "close BTC"): find the active signal ID in "Current open signals". Update the signal status to EXPIRED, then notify members to alert them.
 
 If confidence in parsing is below 80%, flag for human review. Never guess. Never fabricate price levels.
-Think step-by-step before calling each tool to complete your task.
+Think step-by-step before calling each tool to complete your task. Make sure to do all math evaluations step-by-step first.
 `;
 
 export interface AgentContext {
@@ -63,11 +79,13 @@ const groqTools = anthropicTools.map(t => ({
  * @param messageText The text content of the message
  * @param adminId The sender ID (JID) of the admin
  * @param context Context about the admin's performance and active signals
+ * @param messageId Optional unique WhatsApp message ID to save with the signal
  */
 export async function runSignalAgent(
   messageText: string,
   adminId: string,
-  context: AgentContext
+  context: AgentContext,
+  messageId?: string
 ): Promise<void> {
   console.log(`🤖 Invoking Signum Groq Agent for admin [${context.adminName}] with message: "${messageText.replace(/\n/g, ' ')}"`);
 
@@ -90,13 +108,18 @@ export async function runSignalAgent(
 
   // Agentic loop — runs until agent stops requesting tool usage
   while (true) {
-    const response = await getGroqClient().chat.completions.create({
-      model: MODEL,
-      messages: messages,
-      tools: groqTools,
-      tool_choice: 'auto',
-      max_completion_tokens: 1024,
-    });
+    let response: any;
+    if (process.env.NODE_ENV === 'test') {
+      response = await getGroqClient().chat.completions.create({
+        model: MODEL,
+        messages: messages,
+        tools: groqTools,
+        tool_choice: 'auto',
+        max_completion_tokens: 1024,
+      });
+    } else {
+      response = await callAIWithFallback(messages, groqTools);
+    }
 
     const choice = response.choices[0];
     const message = choice.message;
@@ -104,7 +127,7 @@ export async function runSignalAgent(
     // Track assistant's response (with tool_calls if any)
     messages.push(message);
 
-    console.log(`🤖 Groq response finish reason: [${choice.finish_reason}]`);
+    console.log(`🤖 LLM response finish reason: [${choice.finish_reason}]`);
 
     // Agent has finished or returns final conversational response
     if (choice.finish_reason === 'stop' || !message.tool_calls || message.tool_calls.length === 0) {
@@ -128,6 +151,10 @@ export async function runSignalAgent(
         }
 
         try {
+          // Auto-inject messageId if saving a signal
+          if (name === 'save_signal' && messageId) {
+            input.messageId = messageId;
+          }
           const result = await executeTool(name, input);
           messages.push({
             role: 'tool',

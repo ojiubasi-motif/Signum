@@ -11,6 +11,7 @@ import { processMemberMessage } from '../src/bot/memberInterface';
 import { checkPricesOnce, startPriceWatcher, stopPriceWatcher } from '../src/workers/priceWatcher';
 import { setMockPrice } from '../src/services/binance';
 import { getCachedResolvedSignals, getCachedSignal } from '../src/services/cache';
+import { formatWhatsappNumber } from '../src/utils/formatter';
 
 const TEST_ADMIN_ID = 'test_admin_phase1_updates@s.whatsapp.net';
 const TEST_MEMBER_1 = 'member1_phase1_updates@s.whatsapp.net';
@@ -93,21 +94,23 @@ async function simulateDM(remoteJid: string, text: string): Promise<{ reply: str
     return { reply: '', blocked: true };
   }
 
+  const readableNumber = formatWhatsappNumber(remoteJid);
+
   // Authorize DM check: check if the member exists in the database
   const isAuthorized = await prisma.member.findUnique({
-    where: { whatsappNumber: remoteJid }
+    where: { whatsappNumber: readableNumber }
   });
 
   if (!isAuthorized) {
-    console.warn(`🔒 [Mock Bot] Unauthorized DM from ${remoteJid} blocked.`);
+    console.warn(`🔒 [Mock Bot] Unauthorized DM from ${readableNumber} blocked.`);
     return {
       reply: '🔒 *Access Denied*: You must be a member of the official Signum WhatsApp group to access this bot.',
       blocked: true
     };
   }
 
-  console.log(`💬 [Mock Bot] Processing authorized DM from ${remoteJid}: "${text}"`);
-  const reply = await processMemberMessage(remoteJid, text);
+  console.log(`💬 [Mock Bot] Processing authorized DM from ${readableNumber}: "${text}"`);
+  const reply = await processMemberMessage(readableNumber, text);
   return { reply, blocked: false };
 }
 
@@ -139,6 +142,7 @@ async function runTests() {
               { id: TEST_ADMIN_ID },
               { id: TEST_MEMBER_1 },
               { id: TEST_MEMBER_2 },
+              { id: '12799807852757@lid', jid: '2349999999999@s.whatsapp.net' }
             ],
           };
         }
@@ -161,8 +165,19 @@ async function runTests() {
     const dbMemberNumbers = dbMembers.map(m => m.whatsappNumber);
     console.log('DB members after sync:', dbMemberNumbers);
 
-    if (!dbMemberNumbers.includes(TEST_MEMBER_1) || !dbMemberNumbers.includes(TEST_MEMBER_2) || !dbMemberNumbers.includes(TEST_ADMIN_ID)) {
+    const formattedMember1 = formatWhatsappNumber(TEST_MEMBER_1);
+    const formattedMember2 = formatWhatsappNumber(TEST_MEMBER_2);
+    const formattedAdmin = formatWhatsappNumber(TEST_ADMIN_ID);
+
+    if (!dbMemberNumbers.includes(formattedMember1) || !dbMemberNumbers.includes(formattedMember2) || !dbMemberNumbers.includes(formattedAdmin)) {
       throw new Error('Test 2 Failed: Synchronized members are missing in database.');
+    }
+
+    // Verify dynamic mapping cache is populated
+    const formattedLid = formatWhatsappNumber('12799807852757@lid');
+    console.log('Dynamic mapping formatted LID:', formattedLid);
+    if (formattedLid !== '+234 999 999 9999') {
+      throw new Error(`Test 2 Failed: Dynamic LID mapping cache failed to format correctly. Got: ${formattedLid}`);
     }
 
     // Now test deletion: remove TEST_MEMBER_2 from group list and run sync again
@@ -186,10 +201,10 @@ async function runTests() {
     const dbMemberNumbers2 = dbMembers2.map(m => m.whatsappNumber);
     console.log('DB members after second sync:', dbMemberNumbers2);
 
-    if (dbMemberNumbers2.includes(TEST_MEMBER_2)) {
+    if (dbMemberNumbers2.includes(formattedMember2)) {
       throw new Error('Test 2 Failed: Deactivated/removed member was not deleted from DB.');
     }
-    if (!dbMemberNumbers2.includes(TEST_MEMBER_1)) {
+    if (!dbMemberNumbers2.includes(formattedMember1)) {
       throw new Error('Test 2 Failed: Active member was deleted incorrectly.');
     }
     console.log('✅ Test 2 Passed: Group Sync reconciled membership diffs successfully.');
@@ -216,12 +231,25 @@ async function runTests() {
     console.log('\n--- Test 4: Redis Caching of Resolved Signals ---');
 
     // Setup active admin
-    await prisma.admin.create({
+    const dbAdmin = await prisma.admin.create({
       data: {
         id: TEST_ADMIN_ID,
         name: 'TestAdmin',
       }
     });
+
+    // Setup active member (find existing or create)
+    const memberNum = formatWhatsappNumber(TEST_MEMBER_1);
+    let dbMember = await prisma.member.findUnique({
+      where: { whatsappNumber: memberNum }
+    });
+    if (!dbMember) {
+      dbMember = await prisma.member.create({
+        data: {
+          whatsappNumber: memberNum,
+        }
+      });
+    }
 
     // Create an open entry signal for GRASS
     const testSignal = await prisma.signal.create({
@@ -241,6 +269,14 @@ async function runTests() {
       }
     });
 
+    // Create a MemberTrade for the member taking this signal
+    const dbTrade = await prisma.memberTrade.create({
+      data: {
+        memberId: dbMember.id,
+        signalId: testSignal.id,
+      }
+    });
+
     // Set mock price to hit take profit
     console.log('Simulating TP hit for GRASS (setting mock price to 0.40)...');
     setMockPrice('GRASS', 0.40);
@@ -256,6 +292,22 @@ async function runTests() {
       throw new Error('Test 4 Failed: Signal was not resolved as TP_HIT in database.');
     }
 
+    // Verify MemberTrade outcome updated in DB
+    const updatedTrade = await prisma.memberTrade.findUnique({
+      where: { id: dbTrade.id },
+    });
+    if (!updatedTrade || updatedTrade.outcome !== 'WIN') {
+      throw new Error(`Test 4 Failed: MemberTrade outcome was not updated to WIN. Got: ${updatedTrade?.outcome}`);
+    }
+
+    // Verify Admin stats updated in DB
+    const updatedAdmin = await prisma.admin.findUnique({
+      where: { id: TEST_ADMIN_ID },
+    });
+    if (!updatedAdmin || updatedAdmin.totalSignals !== 1 || updatedAdmin.totalWins !== 1 || updatedAdmin.winRate !== 100) {
+      throw new Error(`Test 4 Failed: Admin stats were not updated. Got: signals=${updatedAdmin?.totalSignals}, wins=${updatedAdmin?.totalWins}, winRate=${updatedAdmin?.winRate}`);
+    }
+
     // Verify cache in Redis
     const cachedObj = await getCachedSignal(testSignal.id);
     console.log('Cached object read from Redis:', cachedObj);
@@ -268,13 +320,13 @@ async function runTests() {
     if (cachedList.length === 0 || !cachedList.some(s => s.id === testSignal.id)) {
       throw new Error('Test 4 Failed: Resolved signal ID not present in signals:resolved sorted set.');
     }
-    console.log('✅ Test 4 Passed: Cache is populated automatically upon signal resolution.');
+    console.log('✅ Test 4 Passed: Cache, trade outcome, and admin stats are updated automatically upon signal resolution.');
 
     // ── Test 5: Bot Interface Reads Cached Signals ──
     console.log('\n--- Test 5: Bot Command Cache Reads & Groq Context ---');
 
     // Execute expired signal history command
-    const historyResponse = await processMemberMessage(TEST_MEMBER_1, 'expired');
+    const historyResponse = await processMemberMessage(formattedMember1, 'expired');
     console.log('History command response:\n', historyResponse);
     if (!historyResponse.includes('GRASS') || !historyResponse.includes('TP_HIT') || !historyResponse.includes('Cached')) {
       throw new Error('Test 5 Failed: History query did not fallback to cached signals.');
@@ -283,7 +335,7 @@ async function runTests() {
     // Execute Groq conversational message to verify cache feed
     if (process.env.GROQ_API_KEY) {
       console.log('Querying Groq conversational bot with context verification...');
-      const groqReply = await processMemberMessage(TEST_MEMBER_1, 'what is the status of the recently closed GRASS signal? Keep the answer under 2 sentences.');
+      const groqReply = await processMemberMessage(formattedMember1, 'what is the status of the recently closed GRASS signal? Keep the answer under 2 sentences.');
       console.log('Groq response:\n', groqReply);
       if (!groqReply || groqReply.includes('Signum Error') || !groqReply.toLowerCase().includes('grass')) {
         throw new Error('Test 5 Failed: Groq response did not resolve query or lacked cached signal context.');

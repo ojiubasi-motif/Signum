@@ -6,7 +6,7 @@ import { redisConnection } from '../config/redis';
 export const signalWorker = new Worker(
   'signals',
   async (job) => {
-    const { type, text, adminId } = job.data;
+    const { type, text, adminId, messageId } = job.data;
 
     if (type !== 'PROCESS_NEW_MESSAGE') {
       console.log(`⚙️ Worker skipping job type: ${type}`);
@@ -21,7 +21,7 @@ export const signalWorker = new Worker(
 
       console.log(`⚙️ Starting agent run for ${context.adminName}...`);
 
-      await runSignalAgent(text, adminId, context);
+      await runSignalAgent(text, adminId, context, messageId);
 
       console.log(`✅ Job [${job.id}] processed successfully`);
     } catch (error: any) {

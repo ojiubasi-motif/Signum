@@ -10,7 +10,20 @@ import { prisma } from '../db/src/index';
 import { ADMIN_NUMBERS, TARGET_GROUP_ID } from '../config/constants';
 import { processMemberMessage } from './memberInterface';
 import { syncGroupParticipants } from '../services/groupSync';
+import { formatWhatsappNumber } from '../utils/formatter';
+import { setWhatsappSocket } from '../services/whatsapp';
+import { sendPushNotification } from '../services/fcm';
 import pino from 'pino';
+
+// Helper to resolve an incoming JID to its canonical admin JID if it matches
+function getCanonicalAdminJid(jid: string): string {
+  if (!jid) return jid;
+  const formattedJid = formatWhatsappNumber(jid);
+  const matchedAdmin = ADMIN_NUMBERS.find(
+    adminJid => formatWhatsappNumber(adminJid) === formattedJid
+  );
+  return matchedAdmin || jid;
+}
 
 export async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('./auth-session');
@@ -23,6 +36,8 @@ export async function startBot() {
     markOnlineOnConnect: false,   // stay invisible
     printQRInTerminal: false      // custom QR printing below
   });
+
+  setWhatsappSocket(sock);
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -63,55 +78,158 @@ export async function startBot() {
     for (const msg of messages) {
       if (msg.key.fromMe) continue;
 
-      const text = extractText(msg);
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid) continue;
+
+      // Ignore WhatsApp status updates and general broadcasts
+      if (
+        remoteJid === 'status@broadcast' ||
+        remoteJid.endsWith('@broadcast') ||
+        msg.broadcast === true
+      ) {
+        continue;
+      }
+
+      // Check for message deletion (revoke)
+      const protocolMsg = msg.message?.protocolMessage;
+      if (protocolMsg && ((protocolMsg.type as any) === 3 || (protocolMsg.type as any) === 'REVOKE')) {
+        const deletedMsgId = protocolMsg.key?.id;
+        const sender = msg.key.participant || msg.participant || '';
+        const canonicalSender = getCanonicalAdminJid(sender);
+        
+        if (remoteJid === TARGET_GROUP_ID && ADMIN_NUMBERS.includes(canonicalSender) && deletedMsgId) {
+          console.log(`🗑️ Signal Author deleted message. ID: ${deletedMsgId}. Deleting signal from DB...`);
+          try {
+            const signalToDel = await prisma.signal.findFirst({
+              where: { messageId: deletedMsgId }
+            });
+            if (signalToDel) {
+              await prisma.$transaction([
+                prisma.memberTrade.deleteMany({
+                  where: { signalId: signalToDel.id }
+                }),
+                prisma.signal.delete({
+                  where: { id: signalToDel.id }
+                })
+              ]);
+              console.log(`✅ Successfully deleted signal ${signalToDel.id} and its associated member trades.`);
+            }
+          } catch (err: any) {
+            console.error(`❌ Failed to delete signal for messageId ${deletedMsgId}:`, err.message);
+          }
+        }
+        continue;
+      }
+
+      const text = extractText(msg);
       const sender = msg.key.participant || remoteJid;
 
       // Temporary log to help locate TARGET_GROUP_ID and admin numbers
       console.log(`📩 Message Event: "${text ?? '[No Text]'}"`);
-      console.log(`   └─ From (Group/Chat JID): ${remoteJid}`);
-      console.log(`   └─ Sender (User JID):      ${sender}`);
-
-      // Ignore WhatsApp status updates and general broadcasts
-      if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@broadcast')) {
-        continue;
-      }
+      console.log(`   └─ From (Group/Chat JID): ${formatWhatsappNumber(remoteJid)}`);
+      console.log(`   └─ Sender (User JID):      ${formatWhatsappNumber(sender)}`);
 
       // Handle member DMs
       if (remoteJid !== TARGET_GROUP_ID) {
         if (!text) continue;
 
-        // Authorize DM check: check if the member exists in the database
-        const isAuthorized = await prisma.member.findUnique({
-          where: { whatsappNumber: remoteJid }
-        });
+        const canonicalRemoteJid = getCanonicalAdminJid(remoteJid);
+        const isAdmin = ADMIN_NUMBERS.includes(canonicalRemoteJid);
+        let processedChoice = false;
+
+        if (isAdmin) {
+          const pendingSignal = await prisma.signal.findFirst({
+            where: {
+              adminId: canonicalRemoteJid,
+              status: 'PENDING',
+              coingeckoId: null
+            },
+            orderBy: {
+              createdAt: 'desc'
+            }
+          });
+
+          if (pendingSignal && pendingSignal.enrichment) {
+            const enrichment = pendingSignal.enrichment as any;
+            const candidates = enrichment.coingeckoCandidates;
+            if (Array.isArray(candidates) && candidates.length > 0) {
+              const choiceIndex = parseInt(text.trim(), 10) - 1;
+              if (!isNaN(choiceIndex) && choiceIndex >= 0 && choiceIndex < candidates.length) {
+                const selectedCoin = candidates[choiceIndex];
+
+                // Update signal
+                await prisma.signal.update({
+                  where: { id: pendingSignal.id },
+                  data: {
+                    coingeckoId: selectedCoin.id,
+                    status: 'ENTRY_OPEN'
+                  }
+                });
+
+                // Send member notification alert
+                const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+                await sendPushNotification({
+                  signalId: pendingSignal.id,
+                  urgencyScore: pendingSignal.urgencyScore,
+                  message: alertMsg
+                });
+
+                await sock.sendMessage(remoteJid, {
+                  text: `✅ CoinGecko ID resolved to *${selectedCoin.name}* (${selectedCoin.id}). Signal is now active and members have been notified!`
+                });
+
+                await sock.sendMessage(TARGET_GROUP_ID, {
+                  text: `📈 *Signal Activated*: ${pendingSignal.direction} ${pendingSignal.asset} (CoinGecko: ${selectedCoin.name})`
+                });
+
+                processedChoice = true;
+              } else {
+                await sock.sendMessage(remoteJid, {
+                  text: `⚠️ Invalid selection. Please reply with a number between 1 and ${candidates.length} corresponding to the options above.`
+                });
+                processedChoice = true;
+              }
+            }
+          }
+        }
+
+        if (processedChoice) {
+          continue;
+        }
+
+        const readableNumber = formatWhatsappNumber(remoteJid);
+
+        // Authorize DM check: check if the member exists in the database or is an admin
+        const isAuthorized = isAdmin || (await prisma.member.findUnique({
+          where: { whatsappNumber: readableNumber }
+        }));
 
         if (!isAuthorized) {
-          console.warn(`🔒 Unauthorized DM from ${remoteJid} blocked.`);
+          console.warn(`🔒 Unauthorized DM from ${readableNumber} blocked.`);
           try {
             await sock.sendMessage(remoteJid, {
               text: '🔒 *Access Denied*: You must be a member of the official Signum WhatsApp group to access this bot.'
             });
           } catch (err: any) {
-            console.error(`❌ Failed to send access denied warning to ${remoteJid}:`, err.message);
+            console.error(`❌ Failed to send access denied warning to ${readableNumber}:`, err.message);
           }
           continue;
         }
 
-        console.log(`💬 Member DM from ${remoteJid}: "${text}"`);
+        console.log(`💬 Member DM from ${readableNumber}: "${text}"`);
         try {
-          const reply = await processMemberMessage(remoteJid, text);
+          const reply = await processMemberMessage(readableNumber, text);
           await sock.sendMessage(remoteJid, { text: reply });
         } catch (err: any) {
-          console.error(`❌ Failed to process member DM from ${remoteJid}:`, err.message);
+          console.error(`❌ Failed to process member DM from ${readableNumber}:`, err.message);
         }
         continue;
       }
 
       // Only process messages from the 2 admins in group
       const senderId = msg.key.participant ?? '';
-      if (!ADMIN_NUMBERS.includes(senderId)) continue;
+      const canonicalSenderId = getCanonicalAdminJid(senderId);
+      if (!ADMIN_NUMBERS.includes(canonicalSenderId)) continue;
 
       if (!text) continue;
 
@@ -119,12 +237,12 @@ export async function startBot() {
       await signalQueue.add('signal', {
         type: 'PROCESS_NEW_MESSAGE',
         text,
-        adminId: senderId,
+        adminId: canonicalSenderId,
         messageId: msg.key.id ?? '',
         timestamp: Number(msg.messageTimestamp)
       });
 
-      console.log(`📡 Sniped from ${senderId}: ${text.slice(0, 60)}...`);
+      console.log(`📡 Sniped from ${canonicalSenderId}: ${text.slice(0, 60)}...`);
     }
   });
 }

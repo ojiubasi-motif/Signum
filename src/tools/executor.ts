@@ -1,6 +1,7 @@
 import { getLivePrice } from '../services/binance';
-import { saveSignalToDB, updateStatus } from '../services/db';
+import { saveSignalToDB, updateStatus, adjustSignalInDB } from '../services/db';
 import { sendPushNotification } from '../services/fcm';
+import { prisma } from '../db/src/index';
 
 /**
  * Executes an agent tool request by routing it to the appropriate service.
@@ -17,7 +18,14 @@ export async function executeTool(name: string, input: any): Promise<any> {
 
     case 'save_signal':
       const signalId = await saveSignalToDB(input);
-      return { signalId };
+      const signal = await prisma.signal.findUnique({
+        where: { id: signalId },
+        select: { status: true }
+      });
+      return {
+        signalId,
+        pendingCoingecko: signal?.status === 'PENDING'
+      };
 
     case 'notify_members':
       const sent = await sendPushNotification(input);
@@ -26,6 +34,10 @@ export async function executeTool(name: string, input: any): Promise<any> {
     case 'update_signal_status':
       const updated = await updateStatus(input.signalId, input.status);
       return { updated };
+
+    case 'adjust_signal':
+      const adjusted = await adjustSignalInDB(input);
+      return { adjusted: !!adjusted };
 
     default:
       throw new Error(`Unknown tool: ${name}`);

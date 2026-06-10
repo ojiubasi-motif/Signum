@@ -1,5 +1,6 @@
 import { prisma } from '../db/src/index';
 import { TARGET_GROUP_ID } from '../config/constants';
+import { LID_TO_PHONE_CACHE, formatWhatsappNumber } from '../utils/formatter';
 
 let syncInProgress = false;
 
@@ -24,35 +25,44 @@ export async function syncGroupParticipants(sock: any): Promise<boolean> {
       throw new Error('Could not retrieve participants list from group metadata.');
     }
 
-    const currentGroupParticipantJids = metadata.participants.map((p: any) => p.id);
-    console.log(`👥 groupSync: Found ${currentGroupParticipantJids.length} active participant(s) in WhatsApp group.`);
+    // Populate dynamic LID-to-Phone number mapping cache from Baileys participants metadata
+    for (const p of metadata.participants) {
+      if (p.id && p.jid) {
+        const rawLid = p.id.split('@')[0];
+        const rawPhone = p.jid.split('@')[0];
+        LID_TO_PHONE_CACHE.set(rawLid, rawPhone);
+      }
+    }
+
+    const currentGroupParticipantNumbers = metadata.participants.map((p: any) => formatWhatsappNumber(p.jid || p.id));
+    console.log(`👥 groupSync: Found ${currentGroupParticipantNumbers.length} active participant(s) in WhatsApp group.`);
 
     // 2. Fetch currently registered members from database
     const registeredMembers = await prisma.member.findMany({
       select: { whatsappNumber: true },
     });
-    const registeredMemberJids = registeredMembers.map(m => m.whatsappNumber);
+    const registeredMemberNumbers = registeredMembers.map(m => m.whatsappNumber);
 
-    // 3. Find JIDs to add and JIDs to remove
-    const jidsToAdd = currentGroupParticipantJids.filter((jid: string) => !registeredMemberJids.includes(jid));
-    const jidsToRemove = registeredMemberJids.filter((jid: string) => !currentGroupParticipantJids.includes(jid));
+    // 3. Find formatted numbers to add and remove
+    const numbersToAdd = currentGroupParticipantNumbers.filter((num: string) => !registeredMemberNumbers.includes(num));
+    const numbersToRemove = registeredMemberNumbers.filter((num: string) => !currentGroupParticipantNumbers.includes(num));
 
     // 4. Perform database mutations
-    if (jidsToAdd.length > 0) {
-      console.log(`👥 groupSync: Adding ${jidsToAdd.length} new member(s) to DB...`);
+    if (numbersToAdd.length > 0) {
+      console.log(`👥 groupSync: Adding ${numbersToAdd.length} new member(s) to DB...`);
       await prisma.member.createMany({
-        data: jidsToAdd.map((jid: string) => ({ whatsappNumber: jid })),
+        data: numbersToAdd.map((num: string) => ({ whatsappNumber: num })),
         skipDuplicates: true,
       });
     }
 
-    if (jidsToRemove.length > 0) {
-      console.log(`👥 groupSync: Removing ${jidsToRemove.length} inactive member(s) from DB...`);
+    if (numbersToRemove.length > 0) {
+      console.log(`👥 groupSync: Removing ${numbersToRemove.length} inactive member(s) from DB...`);
       // First delete associated MemberTrades to prevent constraint violations
       await prisma.memberTrade.deleteMany({
         where: {
           member: {
-            whatsappNumber: { in: jidsToRemove },
+            whatsappNumber: { in: numbersToRemove },
           },
         },
       });
@@ -60,7 +70,7 @@ export async function syncGroupParticipants(sock: any): Promise<boolean> {
       // Delete Member records
       await prisma.member.deleteMany({
         where: {
-          whatsappNumber: { in: jidsToRemove },
+          whatsappNumber: { in: numbersToRemove },
         },
       });
     }

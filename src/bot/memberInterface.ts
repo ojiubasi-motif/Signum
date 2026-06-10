@@ -1,6 +1,7 @@
 import { prisma } from '../db/src/index';
 import { getLivePrice, setMockPrice } from '../services/binance';
 import { getCachedResolvedSignals } from '../services/cache';
+import { formatWhatsappNumber } from '../utils/formatter';
 import Groq from 'groq-sdk';
 
 let groqInstance: Groq | null = null;
@@ -49,7 +50,7 @@ export async function processMemberMessage(from: string, text: string): Promise<
           `├─ Take Profit: $${s.tpPrice} (+${s.tpPercent}%)\n` +
           `├─ Stop Loss: $${s.slPrice} (-${s.slPercent}%)\n` +
           `├─ Risk/Reward Ratio: 1:${s.rrRatio.toFixed(2)}\n` +
-          `└─ Posted By: Admin *${s.admin.name}*`
+          `└─ Posted By: Admin *${s.admin.name === s.admin.id.split('@')[0] ? formatWhatsappNumber(s.admin.id) : s.admin.name}*`
       )
       .join('\n\n');
 
@@ -95,7 +96,7 @@ export async function processMemberMessage(from: string, text: string): Promise<
     reply += admins
       .map(
         a =>
-          `👤 *Admin ${a.name}*\n` +
+          `👤 *Admin ${a.name === a.id.split('@')[0] ? formatWhatsappNumber(a.id) : a.name}*\n` +
           `├─ Win Rate: ${a.winRate.toFixed(1)}%\n` +
           `├─ Total Signals: ${a.totalSignals}\n` +
           `└─ Wins/Losses: ${a.totalWins} / ${a.totalSignals - a.totalWins}`

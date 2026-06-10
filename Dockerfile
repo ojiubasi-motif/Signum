@@ -24,6 +24,8 @@ RUN npm run build || echo "Build skipped or completed"
 # Stage 2: Production Runner
 FROM node:20-alpine AS runner
 
+RUN apk add --no-cache --repository=http://dl-cdn.alpinelinux.org/alpine/v3.17/main/ openssl
+
 WORKDIR /app
 
 ENV NODE_ENV=production
