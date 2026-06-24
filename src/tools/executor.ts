@@ -1,5 +1,5 @@
 import { getLivePrice } from '../services/binance';
-import { saveSignalToDB, updateStatus, adjustSignalInDB } from '../services/db';
+import { saveSignalToDB, updateStatus, adjustSignalInDB, flagSignalForReview } from '../services/db';
 import { sendPushNotification } from '../services/fcm';
 import { prisma } from '../db/src/index';
 
@@ -38,6 +38,10 @@ export async function executeTool(name: string, input: any): Promise<any> {
     case 'adjust_signal':
       const adjusted = await adjustSignalInDB(input);
       return { adjusted: !!adjusted };
+
+    case 'flag_for_review':
+      const reviewSignalId = await flagSignalForReview(input);
+      return { signalId: reviewSignalId, flaggedForReview: true };
 
     default:
       throw new Error(`Unknown tool: ${name}`);

@@ -8,33 +8,108 @@ const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const index_1 = require("../../db/src/index");
 const auth_1 = require("../middleware/auth");
 const binance_1 = require("../../services/binance");
+const formatter_1 = require("../../utils/formatter");
+const redis_1 = require("../../config/redis");
+const whatsapp_1 = require("../../services/whatsapp");
+const constants_1 = require("../../config/constants");
+const crypto_1 = __importDefault(require("crypto"));
 const router = (0, express_1.Router)();
-// POST /members/register (also acts as login)
-router.post('/register', async (req, res) => {
+// POST /members/request-otp - Generate and send OTP via WhatsApp bot
+router.post('/request-otp', async (req, res) => {
     try {
         const { whatsappNumber } = req.body;
         if (!whatsappNumber || typeof whatsappNumber !== 'string') {
             res.status(400).json({ error: 'whatsappNumber is required and must be a string' });
             return;
         }
-        const cleanNumber = whatsappNumber.trim();
+        const cleanNumber = whatsappNumber.trim().replace(/\D/g, '');
         // Validate format (digits only, length between 7 and 15)
         if (!/^\d{7,15}$/.test(cleanNumber)) {
             res.status(400).json({ error: 'whatsappNumber must be a valid phone number (digits only, 7-15 chars)' });
             return;
         }
-        // Find or create member
+        const normalizedNumber = (0, formatter_1.formatWhatsappNumber)(`${cleanNumber}@s.whatsapp.net`);
+        // 1. Authorize: check if member exists in DB (synced from group) or is an admin JID
+        const member = await index_1.prisma.member.findUnique({
+            where: { whatsappNumber: normalizedNumber }
+        });
+        const matchingAdminJid = constants_1.ADMIN_NUMBERS.find(adminJid => {
+            return (0, formatter_1.formatWhatsappNumber)(adminJid) === normalizedNumber;
+        });
+        if (!member && !matchingAdminJid) {
+            res.status(403).json({ error: 'Access Denied: You must be an active member of the official Signum WhatsApp group.' });
+            return;
+        }
+        // 2. Generate secure 6-digit OTP
+        const otp = crypto_1.default.randomInt(100000, 1000000).toString();
+        // 3. Store OTP in Redis with 5-minute expiration (300 seconds)
+        const redisKey = `otp:${normalizedNumber}`;
+        await redis_1.redisConnection.setex(redisKey, 300, otp);
+        // 4. Send OTP via WhatsApp
+        const jid = matchingAdminJid || `${cleanNumber}@s.whatsapp.net`;
+        const messageText = `🔒 *Signum Verification Code* 🔒\n\nYour 6-digit one-time verification code is:\n\n*${otp}*\n\nThis code will expire in 5 minutes. Do not share this code with anyone.`;
+        const sent = await (0, whatsapp_1.sendWhatsappMessage)(jid, messageText);
+        if (!sent) {
+            res.status(500).json({ error: 'Failed to send verification message. Please ensure the WhatsApp bot is running.' });
+            return;
+        }
+        res.status(200).json({ message: 'Verification code sent successfully to your WhatsApp DM.' });
+    }
+    catch (error) {
+        console.error('Error in request-otp:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+// POST /members/verify-otp - Verify OTP and issue JWT token
+router.post('/verify-otp', async (req, res) => {
+    try {
+        const { whatsappNumber, code } = req.body;
+        if (!whatsappNumber || typeof whatsappNumber !== 'string' || !code || typeof code !== 'string') {
+            res.status(400).json({ error: 'whatsappNumber and code are required and must be strings' });
+            return;
+        }
+        const cleanNumber = whatsappNumber.trim().replace(/\D/g, '');
+        const cleanCode = code.trim();
+        if (!/^\d{7,15}$/.test(cleanNumber)) {
+            res.status(400).json({ error: 'whatsappNumber must be a valid phone number (digits only, 7-15 chars)' });
+            return;
+        }
+        const normalizedNumber = (0, formatter_1.formatWhatsappNumber)(`${cleanNumber}@s.whatsapp.net`);
+        // 1. Retrieve OTP from Redis
+        const redisKey = `otp:${normalizedNumber}`;
+        const cachedOtp = await redis_1.redisConnection.get(redisKey);
+        if (!cachedOtp) {
+            res.status(400).json({ error: 'Verification code has expired or was not requested. Please request a new code.' });
+            return;
+        }
+        // 2. Verify OTP code
+        if (cachedOtp !== cleanCode) {
+            res.status(401).json({ error: 'Invalid verification code. Please check the code and try again.' });
+            return;
+        }
+        // 3. OTP verified, delete it from Redis to prevent replay
+        await redis_1.redisConnection.del(redisKey);
+        // 4. Find or create member
         let member = await index_1.prisma.member.findUnique({
-            where: { whatsappNumber: cleanNumber }
+            where: { whatsappNumber: normalizedNumber }
         });
         if (!member) {
-            member = await index_1.prisma.member.create({
-                data: {
-                    whatsappNumber: cleanNumber,
-                    alertsEnabled: true
-                }
-            });
+            // If they are an admin not in the member table, auto-create a member record for them
+            const isAdmin = constants_1.ADMIN_NUMBERS.some(adminJid => (0, formatter_1.formatWhatsappNumber)(adminJid) === normalizedNumber);
+            if (isAdmin) {
+                member = await index_1.prisma.member.create({
+                    data: {
+                        whatsappNumber: normalizedNumber,
+                        alertsEnabled: true
+                    }
+                });
+            }
+            else {
+                res.status(403).json({ error: 'Access Denied: You must be an active member of the official Signum WhatsApp group.' });
+                return;
+            }
         }
+        // 5. Sign JWT token
         const secret = (0, auth_1.getJwtSecret)();
         const token = jsonwebtoken_1.default.sign({ memberId: member.id, whatsappNumber: member.whatsappNumber }, secret, { algorithm: 'HS256', expiresIn: '30d' });
         res.status(200).json({
@@ -48,7 +123,7 @@ router.post('/register', async (req, res) => {
         });
     }
     catch (error) {
-        console.error('Error during registration/login:', error);
+        console.error('Error in verify-otp:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -82,8 +157,10 @@ router.post('/trade/:signalId', auth_1.authenticateJWT, async (req, res) => {
             outcome = 'WIN';
         else if (signal.status === 'SL_HIT')
             outcome = 'LOSS';
-        else if (['ENTRY_MISSED', 'EXPIRED'].includes(signal.status))
+        else if (signal.status === 'ENTRY_MISSED')
             outcome = 'MISSED';
+        else if (signal.status === 'EXPIRED')
+            outcome = 'CANCELED';
         const trade = await index_1.prisma.memberTrade.create({
             data: {
                 memberId,
@@ -117,13 +194,32 @@ router.get('/:id/portfolio', auth_1.authenticateJWT, async (req, res) => {
         let winCount = 0;
         let lossCount = 0;
         let missedCount = 0;
+        let canceledCount = 0;
         let completedPnL = 0;
+        let totalValidTrades = 0;
         const completedTrades = [];
         const activeTrades = [];
         for (const trade of trades) {
             const signal = trade.signal;
             const isResolved = ['TP_HIT', 'SL_HIT', 'ENTRY_MISSED', 'EXPIRED'].includes(signal.status);
             if (isResolved) {
+                if (signal.status === 'EXPIRED') {
+                    canceledCount++;
+                    completedTrades.push({
+                        tradeId: trade.id,
+                        signalId: signal.id,
+                        asset: signal.asset,
+                        direction: signal.direction,
+                        status: signal.status,
+                        outcome: 'CANCELED',
+                        tpPercent: signal.tpPercent,
+                        slPercent: signal.slPercent,
+                        takenAt: trade.takenAt,
+                        resolvedAt: signal.resolvedAt
+                    });
+                    continue;
+                }
+                totalValidTrades++;
                 if (signal.status === 'TP_HIT') {
                     winCount++;
                     completedPnL += signal.tpPercent; // simple percentage gain summation
@@ -149,6 +245,7 @@ router.get('/:id/portfolio', auth_1.authenticateJWT, async (req, res) => {
                 });
             }
             else {
+                totalValidTrades++;
                 // Active signal: calculate floating P&L using live price
                 let currentPrice = null;
                 let floatingPnL = 0;
@@ -180,10 +277,11 @@ router.get('/:id/portfolio', auth_1.authenticateJWT, async (req, res) => {
             }
         }
         res.json({
-            totalTrades: trades.length,
+            totalTrades: totalValidTrades,
             winCount,
             lossCount,
             missedCount,
+            canceledCount,
             completedPnLPercent: parseFloat(completedPnL.toFixed(2)),
             completedTrades,
             activeTrades

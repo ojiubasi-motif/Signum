@@ -3,11 +3,16 @@ import jwt from 'jsonwebtoken';
 import { prisma } from '../../db/src/index';
 import { authenticateJWT, AuthenticatedRequest, getJwtSecret } from '../middleware/auth';
 import { getLivePrice } from '../../services/binance';
+import { formatWhatsappNumber } from '../../utils/formatter';
+import { redisConnection } from '../../config/redis';
+import { sendWhatsappMessage } from '../../services/whatsapp';
+import { ADMIN_NUMBERS } from '../../config/constants';
+import crypto from 'crypto';
 
 const router = Router();
 
-// POST /members/register (also acts as login)
-router.post('/register', async (req: AuthenticatedRequest, res: Response) => {
+// POST /members/request-otp - Generate and send OTP via WhatsApp bot
+router.post('/request-otp', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { whatsappNumber } = req.body;
 
@@ -16,27 +21,113 @@ router.post('/register', async (req: AuthenticatedRequest, res: Response) => {
       return;
     }
 
-    const cleanNumber = whatsappNumber.trim();
+    const cleanNumber = whatsappNumber.trim().replace(/\D/g, '');
     // Validate format (digits only, length between 7 and 15)
     if (!/^\d{7,15}$/.test(cleanNumber)) {
       res.status(400).json({ error: 'whatsappNumber must be a valid phone number (digits only, 7-15 chars)' });
       return;
     }
 
-    // Find or create member
+    const normalizedNumber = formatWhatsappNumber(`${cleanNumber}@s.whatsapp.net`);
+
+    // 1. Authorize: check if member exists in DB (synced from group) or is an admin JID
+    const member = await prisma.member.findUnique({
+      where: { whatsappNumber: normalizedNumber }
+    });
+
+    const matchingAdminJid = ADMIN_NUMBERS.find(adminJid => {
+      return formatWhatsappNumber(adminJid) === normalizedNumber;
+    });
+
+    if (!member && !matchingAdminJid) {
+      res.status(403).json({ error: 'Access Denied: You must be an active member of the official Signum WhatsApp group.' });
+      return;
+    }
+
+    // 2. Generate secure 6-digit OTP
+    const otp = crypto.randomInt(100000, 1000000).toString();
+
+    // 3. Store OTP in Redis with 5-minute expiration (300 seconds)
+    const redisKey = `otp:${normalizedNumber}`;
+    await redisConnection.setex(redisKey, 300, otp);
+
+    // 4. Send OTP via WhatsApp
+    const jid = matchingAdminJid || `${cleanNumber}@s.whatsapp.net`;
+    const messageText = `🔒 *Signum Verification Code* 🔒\n\nYour 6-digit one-time verification code is:\n\n*${otp}*\n\nThis code will expire in 5 minutes. Do not share this code with anyone.`;
+    
+    const sent = await sendWhatsappMessage(jid, messageText);
+    if (!sent) {
+      res.status(500).json({ error: 'Failed to send verification message. Please ensure the WhatsApp bot is running.' });
+      return;
+    }
+
+    res.status(200).json({ message: 'Verification code sent successfully to your WhatsApp DM.' });
+  } catch (error: any) {
+    console.error('Error in request-otp:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /members/verify-otp - Verify OTP and issue JWT token
+router.post('/verify-otp', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { whatsappNumber, code } = req.body;
+
+    if (!whatsappNumber || typeof whatsappNumber !== 'string' || !code || typeof code !== 'string') {
+      res.status(400).json({ error: 'whatsappNumber and code are required and must be strings' });
+      return;
+    }
+
+    const cleanNumber = whatsappNumber.trim().replace(/\D/g, '');
+    const cleanCode = code.trim();
+
+    if (!/^\d{7,15}$/.test(cleanNumber)) {
+      res.status(400).json({ error: 'whatsappNumber must be a valid phone number (digits only, 7-15 chars)' });
+      return;
+    }
+
+    const normalizedNumber = formatWhatsappNumber(`${cleanNumber}@s.whatsapp.net`);
+
+    // 1. Retrieve OTP from Redis
+    const redisKey = `otp:${normalizedNumber}`;
+    const cachedOtp = await redisConnection.get(redisKey);
+
+    if (!cachedOtp) {
+      res.status(400).json({ error: 'Verification code has expired or was not requested. Please request a new code.' });
+      return;
+    }
+
+    // 2. Verify OTP code
+    if (cachedOtp !== cleanCode) {
+      res.status(401).json({ error: 'Invalid verification code. Please check the code and try again.' });
+      return;
+    }
+
+    // 3. OTP verified, delete it from Redis to prevent replay
+    await redisConnection.del(redisKey);
+
+    // 4. Find or create member
     let member = await prisma.member.findUnique({
-      where: { whatsappNumber: cleanNumber }
+      where: { whatsappNumber: normalizedNumber }
     });
 
     if (!member) {
-      member = await prisma.member.create({
-        data: {
-          whatsappNumber: cleanNumber,
-          alertsEnabled: true
-        }
-      });
+      // If they are an admin not in the member table, auto-create a member record for them
+      const isAdmin = ADMIN_NUMBERS.some(adminJid => formatWhatsappNumber(adminJid) === normalizedNumber);
+      if (isAdmin) {
+        member = await prisma.member.create({
+          data: {
+            whatsappNumber: normalizedNumber,
+            alertsEnabled: true
+          }
+        });
+      } else {
+        res.status(403).json({ error: 'Access Denied: You must be an active member of the official Signum WhatsApp group.' });
+        return;
+      }
     }
 
+    // 5. Sign JWT token
     const secret = getJwtSecret();
     const token = jwt.sign(
       { memberId: member.id, whatsappNumber: member.whatsappNumber },
@@ -54,7 +145,7 @@ router.post('/register', async (req: AuthenticatedRequest, res: Response) => {
       }
     });
   } catch (error: any) {
-    console.error('Error during registration/login:', error);
+    console.error('Error in verify-otp:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -92,7 +183,8 @@ router.post('/trade/:signalId', authenticateJWT, async (req: AuthenticatedReques
     let outcome: string | null = null;
     if (signal.status === 'TP_HIT') outcome = 'WIN';
     else if (signal.status === 'SL_HIT') outcome = 'LOSS';
-    else if (['ENTRY_MISSED', 'EXPIRED'].includes(signal.status)) outcome = 'MISSED';
+    else if (signal.status === 'ENTRY_MISSED') outcome = 'MISSED';
+    else if (signal.status === 'EXPIRED') outcome = 'CANCELED';
 
     const trade = await prisma.memberTrade.create({
       data: {
@@ -131,6 +223,7 @@ router.get('/:id/portfolio', authenticateJWT, async (req: AuthenticatedRequest, 
     let winCount = 0;
     let lossCount = 0;
     let missedCount = 0;
+    let canceledCount = 0;
     let completedPnL = 0;
     let totalValidTrades = 0;
 
@@ -143,13 +236,14 @@ router.get('/:id/portfolio', authenticateJWT, async (req: AuthenticatedRequest, 
 
       if (isResolved) {
         if (signal.status === 'EXPIRED') {
+          canceledCount++;
           completedTrades.push({
             tradeId: trade.id,
             signalId: signal.id,
             asset: signal.asset,
             direction: signal.direction,
             status: signal.status,
-            outcome: 'MISSED',
+            outcome: 'CANCELED',
             tpPercent: signal.tpPercent,
             slPercent: signal.slPercent,
             takenAt: trade.takenAt,
@@ -220,6 +314,7 @@ router.get('/:id/portfolio', authenticateJWT, async (req: AuthenticatedRequest, 
       winCount,
       lossCount,
       missedCount,
+      canceledCount,
       completedPnLPercent: parseFloat(completedPnL.toFixed(2)),
       completedTrades,
       activeTrades

@@ -83,5 +83,35 @@ export const tools: any[] = [
       },
       required: ['signalId']
     }
+  },
+  {
+    name: 'flag_for_review',
+    description: 'Flag a parsed signal for human review when the agent\'s parsing confidence is below 80%. Saves the signal as PENDING and DMs the admin for manual approval instead of activating it immediately. Use this instead of save_signal when you are uncertain about the parsed values.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        asset: { type: 'string', description: 'e.g. BTC, ETH, SOL' },
+        direction: { type: 'string', enum: ['BUY', 'SELL'] },
+        entryMin: { type: 'number', description: 'Best-guess minimum entry zone price' },
+        entryMax: { type: 'number', description: 'Best-guess maximum entry zone price' },
+        tpPercent: { type: 'number', description: 'Best-guess take profit percentage' },
+        slPercent: { type: 'number', description: 'Best-guess stop loss percentage' },
+        tpPrice: { type: 'number', description: 'Best-guess take profit price' },
+        slPrice: { type: 'number', description: 'Best-guess stop loss price' },
+        rrRatio: { type: 'number', description: 'Best-guess risk-reward ratio' },
+        urgencyScore: { type: 'number', minimum: 1, maximum: 10, description: 'Urgency score' },
+        adminId: { type: 'string', description: 'The admin sender phone number or LID JID' },
+        rawText: { type: 'string', description: 'The original raw message text' },
+        confidence: { type: 'number', minimum: 0, maximum: 100, description: 'Your confidence percentage in the parsed values (0-100)' },
+        reason: { type: 'string', description: 'Brief explanation of what is ambiguous or uncertain' },
+        messageId: { type: 'string', description: 'The unique WhatsApp message ID associated with this signal' }
+      },
+      required: [
+        'asset', 'direction', 'entryMin', 'entryMax',
+        'tpPercent', 'slPercent', 'tpPrice',
+        'slPrice', 'rrRatio', 'adminId', 'rawText',
+        'confidence', 'reason'
+      ]
+    }
   }
 ];

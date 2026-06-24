@@ -5,6 +5,8 @@ exports.saveSignalToDB = saveSignalToDB;
 exports.processAdminCoingeckoChoice = processAdminCoingeckoChoice;
 exports.updateStatus = updateStatus;
 exports.adjustSignalInDB = adjustSignalInDB;
+exports.flagSignalForReview = flagSignalForReview;
+exports.processReviewDecision = processReviewDecision;
 const index_1 = require("../db/src/index");
 const cache_1 = require("./cache");
 const formatter_1 = require("../utils/formatter");
@@ -33,7 +35,6 @@ async function getAdminContext(adminId) {
     }
     const openSignals = await index_1.prisma.signal.findMany({
         where: {
-            adminId,
             status: {
                 in: ['ENTRY_OPEN', 'PENDING'],
             },
@@ -196,8 +197,10 @@ async function updateStatus(signalId, status) {
             outcome = 'WIN';
         else if (status === 'SL_HIT')
             outcome = 'LOSS';
-        else if (status === 'ENTRY_MISSED' || status === 'EXPIRED')
+        else if (status === 'ENTRY_MISSED')
             outcome = 'MISSED';
+        else if (status === 'EXPIRED')
+            outcome = 'CANCELED';
         if (outcome) {
             await index_1.prisma.memberTrade.updateMany({
                 where: { signalId },
@@ -209,7 +212,7 @@ async function updateStatus(signalId, status) {
         const allAdminSignals = await index_1.prisma.signal.findMany({
             where: { adminId },
         });
-        const totalSignals = allAdminSignals.length;
+        const totalSignals = allAdminSignals.filter(s => s.status !== 'EXPIRED' && s.status !== 'PENDING').length;
         const totalWins = allAdminSignals.filter(s => s.status === 'TP_HIT').length;
         const resolvedTradeSignals = allAdminSignals.filter(s => s.status === 'TP_HIT' || s.status === 'SL_HIT').length;
         const winRate = resolvedTradeSignals > 0 ? (totalWins / resolvedTradeSignals) * 100 : 0;
@@ -257,4 +260,109 @@ async function adjustSignalInDB(input) {
         data: dataToUpdate,
     });
     return updated;
+}
+/**
+ * Flags a low-confidence signal for human review.
+ * Saves the signal as PENDING with review metadata in `enrichment`,
+ * then DMs the admin asking them to approve or reject.
+ */
+async function flagSignalForReview(input) {
+    let adminId = input.adminId.trim();
+    // Resolve admin JID if suffix was stripped
+    if (!adminId.includes('@')) {
+        const matchedAdmin = await index_1.prisma.admin.findFirst({
+            where: { id: { startsWith: adminId } },
+        });
+        if (matchedAdmin) {
+            adminId = matchedAdmin.id;
+        }
+    }
+    const signal = await index_1.prisma.signal.create({
+        data: {
+            messageId: input.messageId || null,
+            adminId,
+            asset: input.asset.toUpperCase(),
+            direction: input.direction,
+            entryMin: input.entryMin,
+            entryMax: input.entryMax,
+            tpPercent: input.tpPercent,
+            slPercent: input.slPercent,
+            tpPrice: input.tpPrice,
+            slPrice: input.slPrice,
+            rrRatio: input.rrRatio,
+            urgencyScore: input.urgencyScore,
+            rawText: input.rawText,
+            status: 'PENDING',
+            enrichment: {
+                pendingReview: true,
+                confidence: input.confidence,
+                reason: input.reason,
+            },
+        },
+    });
+    // DM the admin asking for manual review
+    const reviewMsg = `⚠️ *Signal Flagged for Review* (Confidence: ${input.confidence}%)\n\n` +
+        `I'm not fully confident about this parsed signal:\n` +
+        `• *Asset*: ${input.asset.toUpperCase()} (${input.direction})\n` +
+        `• *Entry*: $${input.entryMin} – $${input.entryMax}\n` +
+        `• *TP*: $${input.tpPrice} (+${input.tpPercent}%)\n` +
+        `• *SL*: $${input.slPrice} (-${input.slPercent}%)\n` +
+        `• *R:R*: 1:${input.rrRatio}\n\n` +
+        `📝 *Reason*: ${input.reason}\n\n` +
+        `Reply *approve* to activate this signal and notify members, or *reject* to discard it.`;
+    await (0, whatsapp_1.sendWhatsappMessage)(adminId, reviewMsg);
+    console.log(`🔍 Signal ${signal.id} flagged for human review (confidence: ${input.confidence}%, reason: ${input.reason})`);
+    return signal.id;
+}
+/**
+ * Processes an admin's approval or rejection of a pending review signal.
+ * @returns true if a pending review was found and processed, false otherwise
+ */
+async function processReviewDecision(adminId, decision) {
+    const pendingSignal = await index_1.prisma.signal.findFirst({
+        where: {
+            adminId,
+            status: 'PENDING',
+            enrichment: {
+                path: ['pendingReview'],
+                equals: true,
+            },
+        },
+        orderBy: { createdAt: 'desc' },
+    });
+    if (!pendingSignal) {
+        return { processed: false };
+    }
+    if (decision === 'approve') {
+        await index_1.prisma.signal.update({
+            where: { id: pendingSignal.id },
+            data: {
+                status: 'ENTRY_OPEN',
+                enrichment: {
+                    ...pendingSignal.enrichment,
+                    pendingReview: false,
+                    reviewDecision: 'approved',
+                },
+            },
+        });
+        // Notify members now that admin approved
+        const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+        await (0, fcm_1.sendPushNotification)({
+            signalId: pendingSignal.id,
+            urgencyScore: pendingSignal.urgencyScore,
+            message: alertMsg,
+        });
+        await (0, whatsapp_1.sendWhatsappMessage)(adminId, `✅ Signal *${pendingSignal.asset}* approved and activated! Members have been notified.`);
+        console.log(`✅ Admin approved review signal ${pendingSignal.id}`);
+        return { processed: true, signalId: pendingSignal.id };
+    }
+    else {
+        // Reject — delete the pending signal
+        await index_1.prisma.signal.delete({
+            where: { id: pendingSignal.id },
+        });
+        await (0, whatsapp_1.sendWhatsappMessage)(adminId, `🗑️ Signal *${pendingSignal.asset}* has been rejected and discarded.`);
+        console.log(`🗑️ Admin rejected review signal ${pendingSignal.id}`);
+        return { processed: true, signalId: pendingSignal.id };
+    }
 }

@@ -1,10 +1,11 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../../db/src/index';
+import { authenticateJWT } from '../middleware/auth';
 
 const router = Router();
 
 // GET /signals/active - Retrieve open/pending signals
-router.get('/active', async (req: Request, res: Response) => {
+router.get('/active', authenticateJWT, async (req: Request, res: Response) => {
   try {
     const signals = await prisma.signal.findMany({
       where: {
@@ -27,7 +28,7 @@ router.get('/active', async (req: Request, res: Response) => {
 });
 
 // GET /signals/history - Retrieve resolved/expired/missed signals with support for asset and adminId filters
-router.get('/history', async (req: Request, res: Response) => {
+router.get('/history', authenticateJWT, async (req: Request, res: Response) => {
   try {
     const { asset, adminId } = req.query;
     const whereClause: any = {
@@ -61,7 +62,7 @@ router.get('/history', async (req: Request, res: Response) => {
 });
 
 // GET /signals/:id - Fetch specific signal details
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', authenticateJWT, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     if (typeof id !== 'string') {

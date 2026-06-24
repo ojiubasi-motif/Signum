@@ -13,6 +13,7 @@ import { syncGroupParticipants } from '../services/groupSync';
 import { formatWhatsappNumber } from '../utils/formatter';
 import { setWhatsappSocket } from '../services/whatsapp';
 import { sendPushNotification } from '../services/fcm';
+import { processReviewDecision } from '../services/db';
 import pino from 'pino';
 
 // Helper to resolve an incoming JID to its canonical admin JID if it matches
@@ -151,43 +152,54 @@ export async function startBot() {
 
           if (pendingSignal && pendingSignal.enrichment) {
             const enrichment = pendingSignal.enrichment as any;
-            const candidates = enrichment.coingeckoCandidates;
-            if (Array.isArray(candidates) && candidates.length > 0) {
-              const choiceIndex = parseInt(text.trim(), 10) - 1;
-              if (!isNaN(choiceIndex) && choiceIndex >= 0 && choiceIndex < candidates.length) {
-                const selectedCoin = candidates[choiceIndex];
+            if (enrichment.pendingReview === true) {
+              const cleanText = text.trim().toLowerCase();
+              if (cleanText === 'approve' || cleanText === 'reject' || cleanText === 'yes' || cleanText === 'no') {
+                const decision = (cleanText === 'approve' || cleanText === 'yes') ? 'approve' : 'reject';
+                const { processed } = await processReviewDecision(canonicalRemoteJid, decision);
+                if (processed) {
+                  processedChoice = true;
+                }
+              }
+            } else {
+              const candidates = enrichment.coingeckoCandidates;
+              if (Array.isArray(candidates) && candidates.length > 0) {
+                const choiceIndex = parseInt(text.trim(), 10) - 1;
+                if (!isNaN(choiceIndex) && choiceIndex >= 0 && choiceIndex < candidates.length) {
+                  const selectedCoin = candidates[choiceIndex];
 
-                // Update signal
-                await prisma.signal.update({
-                  where: { id: pendingSignal.id },
-                  data: {
-                    coingeckoId: selectedCoin.id,
-                    status: 'ENTRY_OPEN'
-                  }
-                });
+                  // Update signal
+                  await prisma.signal.update({
+                    where: { id: pendingSignal.id },
+                    data: {
+                      coingeckoId: selectedCoin.id,
+                      status: 'ENTRY_OPEN'
+                    }
+                  });
 
-                // Send member notification alert
-                const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
-                await sendPushNotification({
-                  signalId: pendingSignal.id,
-                  urgencyScore: pendingSignal.urgencyScore,
-                  message: alertMsg
-                });
+                  // Send member notification alert
+                  const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+                  await sendPushNotification({
+                    signalId: pendingSignal.id,
+                    urgencyScore: pendingSignal.urgencyScore,
+                    message: alertMsg
+                  });
 
-                await sock.sendMessage(remoteJid, {
-                  text: `✅ CoinGecko ID resolved to *${selectedCoin.name}* (${selectedCoin.id}). Signal is now active and members have been notified!`
-                });
+                  await sock.sendMessage(remoteJid, {
+                    text: `✅ CoinGecko ID resolved to *${selectedCoin.name}* (${selectedCoin.id}). Signal is now active and members have been notified!`
+                  });
 
-                await sock.sendMessage(TARGET_GROUP_ID, {
-                  text: `📈 *Signal Activated*: ${pendingSignal.direction} ${pendingSignal.asset} (CoinGecko: ${selectedCoin.name})`
-                });
+                  await sock.sendMessage(TARGET_GROUP_ID, {
+                    text: `📈 *Signal Activated*: ${pendingSignal.direction} ${pendingSignal.asset} (CoinGecko: ${selectedCoin.name})`
+                  });
 
-                processedChoice = true;
-              } else {
-                await sock.sendMessage(remoteJid, {
-                  text: `⚠️ Invalid selection. Please reply with a number between 1 and ${candidates.length} corresponding to the options above.`
-                });
-                processedChoice = true;
+                  processedChoice = true;
+                } else {
+                  await sock.sendMessage(remoteJid, {
+                    text: `⚠️ Invalid selection. Please reply with a number between 1 and ${candidates.length} corresponding to the options above.`
+                  });
+                  processedChoice = true;
+                }
               }
             }
           }

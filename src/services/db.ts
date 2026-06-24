@@ -227,7 +227,8 @@ export async function updateStatus(signalId: string, status: 'ENTRY_OPEN' | 'ENT
     let outcome: string | null = null;
     if (status === 'TP_HIT') outcome = 'WIN';
     else if (status === 'SL_HIT') outcome = 'LOSS';
-    else if (status === 'ENTRY_MISSED' || status === 'EXPIRED') outcome = 'MISSED';
+    else if (status === 'ENTRY_MISSED') outcome = 'MISSED';
+    else if (status === 'EXPIRED') outcome = 'CANCELED';
 
     if (outcome) {
       await prisma.memberTrade.updateMany({
@@ -298,4 +299,142 @@ export async function adjustSignalInDB(input: {
   });
 
   return updated;
+}
+
+/**
+ * Flags a low-confidence signal for human review.
+ * Saves the signal as PENDING with review metadata in `enrichment`,
+ * then DMs the admin asking them to approve or reject.
+ */
+export async function flagSignalForReview(input: {
+  adminId: string;
+  asset: string;
+  direction: 'BUY' | 'SELL';
+  entryMin: number;
+  entryMax: number;
+  tpPercent: number;
+  slPercent: number;
+  tpPrice: number;
+  slPrice: number;
+  rrRatio: number;
+  urgencyScore: number;
+  rawText: string;
+  confidence: number;
+  reason: string;
+  messageId?: string;
+}) {
+  let adminId = input.adminId.trim();
+
+  // Resolve admin JID if suffix was stripped
+  if (!adminId.includes('@')) {
+    const matchedAdmin = await prisma.admin.findFirst({
+      where: { id: { startsWith: adminId } },
+    });
+    if (matchedAdmin) {
+      adminId = matchedAdmin.id;
+    }
+  }
+
+  const signal = await prisma.signal.create({
+    data: {
+      messageId: input.messageId || null,
+      adminId,
+      asset: input.asset.toUpperCase(),
+      direction: input.direction,
+      entryMin: input.entryMin,
+      entryMax: input.entryMax,
+      tpPercent: input.tpPercent,
+      slPercent: input.slPercent,
+      tpPrice: input.tpPrice,
+      slPrice: input.slPrice,
+      rrRatio: input.rrRatio,
+      urgencyScore: input.urgencyScore,
+      rawText: input.rawText,
+      status: 'PENDING',
+      enrichment: {
+        pendingReview: true,
+        confidence: input.confidence,
+        reason: input.reason,
+      },
+    },
+  });
+
+  // DM the admin asking for manual review
+  const reviewMsg =
+    `⚠️ *Signal Flagged for Review* (Confidence: ${input.confidence}%)\n\n` +
+    `I'm not fully confident about this parsed signal:\n` +
+    `• *Asset*: ${input.asset.toUpperCase()} (${input.direction})\n` +
+    `• *Entry*: $${input.entryMin} – $${input.entryMax}\n` +
+    `• *TP*: $${input.tpPrice} (+${input.tpPercent}%)\n` +
+    `• *SL*: $${input.slPrice} (-${input.slPercent}%)\n` +
+    `• *R:R*: 1:${input.rrRatio}\n\n` +
+    `📝 *Reason*: ${input.reason}\n\n` +
+    `Reply *approve* to activate this signal and notify members, or *reject* to discard it.`;
+
+  await sendWhatsappMessage(adminId, reviewMsg);
+  console.log(`🔍 Signal ${signal.id} flagged for human review (confidence: ${input.confidence}%, reason: ${input.reason})`);
+
+  return signal.id;
+}
+
+/**
+ * Processes an admin's approval or rejection of a pending review signal.
+ * @returns true if a pending review was found and processed, false otherwise
+ */
+export async function processReviewDecision(
+  adminId: string,
+  decision: 'approve' | 'reject'
+): Promise<{ processed: boolean; signalId?: string }> {
+  const pendingSignal = await prisma.signal.findFirst({
+    where: {
+      adminId,
+      status: 'PENDING',
+      enrichment: {
+        path: ['pendingReview'],
+        equals: true,
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  if (!pendingSignal) {
+    return { processed: false };
+  }
+
+  if (decision === 'approve') {
+    await prisma.signal.update({
+      where: { id: pendingSignal.id },
+      data: {
+        status: 'ENTRY_OPEN',
+        enrichment: {
+          ...(pendingSignal.enrichment as any),
+          pendingReview: false,
+          reviewDecision: 'approved',
+        },
+      },
+    });
+
+    // Notify members now that admin approved
+    const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+    await sendPushNotification({
+      signalId: pendingSignal.id,
+      urgencyScore: pendingSignal.urgencyScore,
+      message: alertMsg,
+    });
+
+    await sendWhatsappMessage(adminId, `✅ Signal *${pendingSignal.asset}* approved and activated! Members have been notified.`);
+    console.log(`✅ Admin approved review signal ${pendingSignal.id}`);
+
+    return { processed: true, signalId: pendingSignal.id };
+  } else {
+    // Reject — delete the pending signal
+    await prisma.signal.delete({
+      where: { id: pendingSignal.id },
+    });
+
+    await sendWhatsappMessage(adminId, `🗑️ Signal *${pendingSignal.asset}* has been rejected and discarded.`);
+    console.log(`🗑️ Admin rejected review signal ${pendingSignal.id}`);
+
+    return { processed: true, signalId: pendingSignal.id };
+  }
 }

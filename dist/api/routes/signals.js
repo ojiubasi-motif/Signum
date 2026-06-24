@@ -2,9 +2,10 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const index_1 = require("../../db/src/index");
+const auth_1 = require("../middleware/auth");
 const router = (0, express_1.Router)();
 // GET /signals/active - Retrieve open/pending signals
-router.get('/active', async (req, res) => {
+router.get('/active', auth_1.authenticateJWT, async (req, res) => {
     try {
         const signals = await index_1.prisma.signal.findMany({
             where: {
@@ -27,7 +28,7 @@ router.get('/active', async (req, res) => {
     }
 });
 // GET /signals/history - Retrieve resolved/expired/missed signals with support for asset and adminId filters
-router.get('/history', async (req, res) => {
+router.get('/history', auth_1.authenticateJWT, async (req, res) => {
     try {
         const { asset, adminId } = req.query;
         const whereClause = {
@@ -58,7 +59,7 @@ router.get('/history', async (req, res) => {
     }
 });
 // GET /signals/:id - Fetch specific signal details
-router.get('/:id', async (req, res) => {
+router.get('/:id', auth_1.authenticateJWT, async (req, res) => {
     try {
         const { id } = req.params;
         if (typeof id !== 'string') {

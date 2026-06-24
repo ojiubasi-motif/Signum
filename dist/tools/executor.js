@@ -35,6 +35,9 @@ async function executeTool(name, input) {
         case 'adjust_signal':
             const adjusted = await (0, db_1.adjustSignalInDB)(input);
             return { adjusted: !!adjusted };
+        case 'flag_for_review':
+            const reviewSignalId = await (0, db_1.flagSignalForReview)(input);
+            return { signalId: reviewSignalId, flaggedForReview: true };
         default:
             throw new Error(`Unknown tool: ${name}`);
     }

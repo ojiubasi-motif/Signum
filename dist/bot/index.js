@@ -47,6 +47,7 @@ const groupSync_1 = require("../services/groupSync");
 const formatter_1 = require("../utils/formatter");
 const whatsapp_1 = require("../services/whatsapp");
 const fcm_1 = require("../services/fcm");
+const db_1 = require("../services/db");
 const pino_1 = __importDefault(require("pino"));
 // Helper to resolve an incoming JID to its canonical admin JID if it matches
 function getCanonicalAdminJid(jid) {
@@ -167,39 +168,51 @@ async function startBot() {
                     });
                     if (pendingSignal && pendingSignal.enrichment) {
                         const enrichment = pendingSignal.enrichment;
-                        const candidates = enrichment.coingeckoCandidates;
-                        if (Array.isArray(candidates) && candidates.length > 0) {
-                            const choiceIndex = parseInt(text.trim(), 10) - 1;
-                            if (!isNaN(choiceIndex) && choiceIndex >= 0 && choiceIndex < candidates.length) {
-                                const selectedCoin = candidates[choiceIndex];
-                                // Update signal
-                                await index_1.prisma.signal.update({
-                                    where: { id: pendingSignal.id },
-                                    data: {
-                                        coingeckoId: selectedCoin.id,
-                                        status: 'ENTRY_OPEN'
-                                    }
-                                });
-                                // Send member notification alert
-                                const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
-                                await (0, fcm_1.sendPushNotification)({
-                                    signalId: pendingSignal.id,
-                                    urgencyScore: pendingSignal.urgencyScore,
-                                    message: alertMsg
-                                });
-                                await sock.sendMessage(remoteJid, {
-                                    text: `✅ CoinGecko ID resolved to *${selectedCoin.name}* (${selectedCoin.id}). Signal is now active and members have been notified!`
-                                });
-                                await sock.sendMessage(constants_1.TARGET_GROUP_ID, {
-                                    text: `📈 *Signal Activated*: ${pendingSignal.direction} ${pendingSignal.asset} (CoinGecko: ${selectedCoin.name})`
-                                });
-                                processedChoice = true;
+                        if (enrichment.pendingReview === true) {
+                            const cleanText = text.trim().toLowerCase();
+                            if (cleanText === 'approve' || cleanText === 'reject' || cleanText === 'yes' || cleanText === 'no') {
+                                const decision = (cleanText === 'approve' || cleanText === 'yes') ? 'approve' : 'reject';
+                                const { processed } = await (0, db_1.processReviewDecision)(canonicalRemoteJid, decision);
+                                if (processed) {
+                                    processedChoice = true;
+                                }
                             }
-                            else {
-                                await sock.sendMessage(remoteJid, {
-                                    text: `⚠️ Invalid selection. Please reply with a number between 1 and ${candidates.length} corresponding to the options above.`
-                                });
-                                processedChoice = true;
+                        }
+                        else {
+                            const candidates = enrichment.coingeckoCandidates;
+                            if (Array.isArray(candidates) && candidates.length > 0) {
+                                const choiceIndex = parseInt(text.trim(), 10) - 1;
+                                if (!isNaN(choiceIndex) && choiceIndex >= 0 && choiceIndex < candidates.length) {
+                                    const selectedCoin = candidates[choiceIndex];
+                                    // Update signal
+                                    await index_1.prisma.signal.update({
+                                        where: { id: pendingSignal.id },
+                                        data: {
+                                            coingeckoId: selectedCoin.id,
+                                            status: 'ENTRY_OPEN'
+                                        }
+                                    });
+                                    // Send member notification alert
+                                    const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+                                    await (0, fcm_1.sendPushNotification)({
+                                        signalId: pendingSignal.id,
+                                        urgencyScore: pendingSignal.urgencyScore,
+                                        message: alertMsg
+                                    });
+                                    await sock.sendMessage(remoteJid, {
+                                        text: `✅ CoinGecko ID resolved to *${selectedCoin.name}* (${selectedCoin.id}). Signal is now active and members have been notified!`
+                                    });
+                                    await sock.sendMessage(constants_1.TARGET_GROUP_ID, {
+                                        text: `📈 *Signal Activated*: ${pendingSignal.direction} ${pendingSignal.asset} (CoinGecko: ${selectedCoin.name})`
+                                    });
+                                    processedChoice = true;
+                                }
+                                else {
+                                    await sock.sendMessage(remoteJid, {
+                                        text: `⚠️ Invalid selection. Please reply with a number between 1 and ${candidates.length} corresponding to the options above.`
+                                    });
+                                    processedChoice = true;
+                                }
                             }
                         }
                     }
