@@ -37,6 +37,7 @@ exports.getOrUpdateCoinList = getOrUpdateCoinList;
 exports.resolveCoingeckoId = resolveCoingeckoId;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+const secureFetch_1 = require("../utils/secureFetch");
 const COINLIST_PATH = path.join(__dirname, '../db/coinlist.json');
 /**
  * Loads the cached CoinGecko coin list or fetches a fresh one from CoinGecko
@@ -81,7 +82,7 @@ async function getOrUpdateCoinList() {
         headers[headerName] = apiKey;
     }
     try {
-        const response = await fetch(`${baseUrl}/coins/list?include_platform=true`, { headers });
+        const response = await (0, secureFetch_1.secureFetch)(`${baseUrl}/coins/list?include_platform=true`, { headers });
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -120,6 +121,11 @@ async function getOrUpdateCoinList() {
  */
 async function resolveCoingeckoId(symbol, entryMin, entryMax) {
     const cleanSymbol = symbol.trim().toLowerCase();
+    // SSRF and Input Sanitization: Validate symbol matches character set rules
+    if (!/^[a-z0-9_\-]+$/.test(cleanSymbol)) {
+        console.warn(`⚠️ CoinGecko: Invalid symbol parameter rejected: "${cleanSymbol}"`);
+        return null;
+    }
     try {
         const list = await getOrUpdateCoinList();
         if (!list || list.length === 0) {
@@ -132,12 +138,8 @@ async function resolveCoingeckoId(symbol, entryMin, entryMax) {
             console.warn(`⚠️ CoinGecko: No coin with symbol "${symbol}" found in coin list`);
             return null;
         }
-        if (candidates.length === 1) {
-            // Only 1 match, return it directly
-            return candidates[0].id;
-        }
-        // Multiple candidates found — verify by current price
-        console.log(`🔍 CoinGecko: Resolving symbol "${symbol}" among ${candidates.length} candidates...`);
+        // verify by current price (even if candidates.length === 1, as per guidelines)
+        console.log(`🔍 CoinGecko: Resolving symbol "${symbol}" among ${candidates.length} candidates by price...`);
         const apiKey = process.env.COINGECKO_API_KEY || '';
         const isDemo = apiKey.startsWith('CG-');
         const baseUrl = isDemo || !apiKey
@@ -156,11 +158,15 @@ async function resolveCoingeckoId(symbol, entryMin, entryMax) {
         }
         const prices = {};
         for (const chunk of idChunks) {
-            const url = `${baseUrl}/simple/price?ids=${chunk.join(',')}&vs_currencies=usd`;
-            const response = await fetch(url, { headers });
+            // Validate IDs in chunk match regex pattern to prevent injection attacks
+            const cleanChunk = chunk.filter(id => /^[a-z0-9_\-]+$/.test(id));
+            if (cleanChunk.length === 0)
+                continue;
+            const url = `${baseUrl}/simple/price?ids=${cleanChunk.join(',')}&vs_currencies=usd`;
+            const response = await (0, secureFetch_1.secureFetch)(url, { headers });
             if (response.ok) {
                 const data = (await response.json());
-                for (const id of chunk) {
+                for (const id of cleanChunk) {
                     if (data[id] && typeof data[id].usd === 'number') {
                         prices[id] = data[id].usd;
                     }
@@ -176,11 +182,6 @@ async function resolveCoingeckoId(symbol, entryMin, entryMax) {
                 matchedId = candidate.id;
                 break;
             }
-        }
-        // Fallback to first candidate if none was matched by entry range
-        if (!matchedId) {
-            matchedId = candidates[0].id;
-            console.warn(`⚠️ CoinGecko: No candidate price fell within range $${entryMin}-$${entryMax} for "${symbol}". Defaulting to first candidate: "${matchedId}"`);
         }
         return matchedId;
     }

@@ -89,10 +89,15 @@ export async function saveSignalToDB(input: {
       const list = await getOrUpdateCoinList();
       candidates = list.filter(c => c.symbol.toLowerCase() === cleanAsset.toLowerCase());
       
-      if (candidates.length === 1) {
-        coingeckoId = candidates[0].id;
-      } else if (candidates.length > 1) {
-        pendingCoingecko = true;
+      if (candidates.length > 0) {
+        // Resolve CoinGecko ID using entry range as per coingecko_query.md
+        const resolvedId = await resolveCoingeckoId(cleanAsset, input.entryMin, input.entryMax);
+        if (resolvedId) {
+          coingeckoId = resolvedId;
+        } else {
+          // If no candidate is within the entry price range, set pendingCoingecko = true to prompt the admin
+          pendingCoingecko = true;
+        }
       }
     } catch (err: any) {
       console.error(`❌ db: Failed to check coingecko list for ${input.asset}:`, err.message);

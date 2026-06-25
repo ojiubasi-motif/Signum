@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { secureFetch } from '../utils/secureFetch';
 
 const COINLIST_PATH = path.join(__dirname, '../db/coinlist.json');
 
@@ -57,7 +58,7 @@ export async function getOrUpdateCoinList(): Promise<CoinListEntry[]> {
   }
 
   try {
-    const response = await fetch(`${baseUrl}/coins/list?include_platform=true`, { headers });
+    const response = await secureFetch(`${baseUrl}/coins/list?include_platform=true`, { headers });
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
@@ -101,6 +102,12 @@ export async function resolveCoingeckoId(
   entryMax: number
 ): Promise<string | null> {
   const cleanSymbol = symbol.trim().toLowerCase();
+
+  // SSRF and Input Sanitization: Validate symbol matches character set rules
+  if (!/^[a-z0-9_\-]+$/.test(cleanSymbol)) {
+    console.warn(`⚠️ CoinGecko: Invalid symbol parameter rejected: "${cleanSymbol}"`);
+    return null;
+  }
   
   try {
     const list = await getOrUpdateCoinList();
@@ -116,13 +123,8 @@ export async function resolveCoingeckoId(
       return null;
     }
 
-    if (candidates.length === 1) {
-      // Only 1 match, return it directly
-      return candidates[0].id;
-    }
-
-    // Multiple candidates found — verify by current price
-    console.log(`🔍 CoinGecko: Resolving symbol "${symbol}" among ${candidates.length} candidates...`);
+    // verify by current price (even if candidates.length === 1, as per guidelines)
+    console.log(`🔍 CoinGecko: Resolving symbol "${symbol}" among ${candidates.length} candidates by price...`);
 
     const apiKey = process.env.COINGECKO_API_KEY || '';
     const isDemo = apiKey.startsWith('CG-');
@@ -146,11 +148,15 @@ export async function resolveCoingeckoId(
     const prices: Record<string, number> = {};
 
     for (const chunk of idChunks) {
-      const url = `${baseUrl}/simple/price?ids=${chunk.join(',')}&vs_currencies=usd`;
-      const response = await fetch(url, { headers });
+      // Validate IDs in chunk match regex pattern to prevent injection attacks
+      const cleanChunk = chunk.filter(id => /^[a-z0-9_\-]+$/.test(id));
+      if (cleanChunk.length === 0) continue;
+
+      const url = `${baseUrl}/simple/price?ids=${cleanChunk.join(',')}&vs_currencies=usd`;
+      const response = await secureFetch(url, { headers });
       if (response.ok) {
         const data = (await response.json()) as any;
-        for (const id of chunk) {
+        for (const id of cleanChunk) {
           if (data[id] && typeof data[id].usd === 'number') {
             prices[id] = data[id].usd;
           }
@@ -167,12 +173,6 @@ export async function resolveCoingeckoId(
         matchedId = candidate.id;
         break;
       }
-    }
-
-    // Fallback to first candidate if none was matched by entry range
-    if (!matchedId) {
-      matchedId = candidates[0].id;
-      console.warn(`⚠️ CoinGecko: No candidate price fell within range $${entryMin}-$${entryMax} for "${symbol}". Defaulting to first candidate: "${matchedId}"`);
     }
 
     return matchedId;

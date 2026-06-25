@@ -1,4 +1,5 @@
 import { tools as anthropicTools } from '../tools/definitions';
+import { secureFetch } from '../utils/secureFetch';
 
 export interface AIProvider {
   name: string;
@@ -66,7 +67,7 @@ function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 15000):
       reject(new Error(`Timeout of ${timeoutMs}ms exceeded`));
     }, timeoutMs);
 
-    fetch(url, { ...options, signal: controller.signal })
+    secureFetch(url, { ...options, signal: controller.signal })
       .then(res => {
         clearTimeout(timeout);
         resolve(res);

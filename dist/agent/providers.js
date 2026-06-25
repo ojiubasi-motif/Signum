@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.providers = void 0;
 exports.callAIWithFallback = callAIWithFallback;
+const secureFetch_1 = require("../utils/secureFetch");
 exports.providers = [
     {
         name: 'groq',
@@ -54,7 +55,7 @@ function fetchWithTimeout(url, options, timeoutMs = 15000) {
             controller.abort();
             reject(new Error(`Timeout of ${timeoutMs}ms exceeded`));
         }, timeoutMs);
-        fetch(url, { ...options, signal: controller.signal })
+        (0, secureFetch_1.secureFetch)(url, { ...options, signal: controller.signal })
             .then(res => {
             clearTimeout(timeout);
             resolve(res);
