@@ -49,6 +49,7 @@ model Member {
   whatsappNumber  String    @unique
   alertsEnabled   Boolean   @default(true)
   fcmToken        String?
+  refreshToken    String?   // SHA-256 hash of the refresh token; never the raw value
   joinedAt        DateTime  @default(now())
   trades          MemberTrade[]
 }

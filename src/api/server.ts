@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import cookieParser from 'cookie-parser';
 import signalsRouter from './routes/signals';
 import adminsRouter from './routes/admins';
 import membersRouter from './routes/members';
@@ -7,6 +8,9 @@ const app = express();
 
 // 1. JSON body parsing
 app.use(express.json());
+
+// 1b. Cookie parser (required for reading httpOnly refresh token cookie)
+app.use(cookieParser());
 
 // 2. Custom Security Headers Middleware
 app.use((req: Request, res: Response, next: NextFunction) => {

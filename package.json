@@ -13,6 +13,7 @@
   "author": "Oji",
   "license": "ISC",
   "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^25.9.2",
@@ -27,6 +28,7 @@
     "@whiskeysockets/baileys": "^6.7.23",
     "bullmq": "^5.78.0",
     "ccxt": "^4.5.56",
+    "cookie-parser": "^1.4.7",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "groq-sdk": "^1.2.1",

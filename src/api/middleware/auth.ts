@@ -20,6 +20,17 @@ export function getJwtSecret(): string {
   return (global as any).ephemeralJwtSecret;
 }
 
+export function getRefreshSecret(): string {
+  if (process.env.REFRESH_TOKEN_SECRET) {
+    return process.env.REFRESH_TOKEN_SECRET;
+  }
+  console.warn('[Security Warning] REFRESH_TOKEN_SECRET is not set in environment variables. Using an ephemeral random secret key (not scalable horizontally).');
+  if (!(global as any).ephemeralRefreshSecret) {
+    (global as any).ephemeralRefreshSecret = crypto.randomBytes(32).toString('hex');
+  }
+  return (global as any).ephemeralRefreshSecret;
+}
+
 export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
   if (!authHeader) {

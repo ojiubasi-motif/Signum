@@ -1,13 +1,59 @@
 import { Router, Response } from 'express';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../../db/src/index';
-import { authenticateJWT, AuthenticatedRequest, getJwtSecret } from '../middleware/auth';
+import { authenticateJWT, AuthenticatedRequest, getJwtSecret, getRefreshSecret } from '../middleware/auth';
 import { getLivePrice } from '../../services/binance';
 import { formatWhatsappNumber } from '../../utils/formatter';
 import { redisConnection } from '../../config/redis';
 import { sendWhatsappMessage } from '../../services/whatsapp';
 import { ADMIN_NUMBERS } from '../../config/constants';
 import crypto from 'crypto';
+
+/** Access token lifetime: 5 minutes */
+const ACCESS_TOKEN_EXPIRY = '5m';
+/** Refresh token lifetime: 30 days */
+const REFRESH_TOKEN_EXPIRY_SECS = 60 * 60 * 24 * 30; // 30 days in seconds
+const REFRESH_TOKEN_EXPIRY_JWT = '30d';
+
+/** Cookie name for the refresh token */
+const REFRESH_COOKIE = 'signum_rt';
+
+/** SHA-256 hash utility — we never store raw refresh tokens */
+function hashToken(raw: string): string {
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+/** Compare two strings in constant time to prevent timing attacks */
+function safeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/** Determine if we're in a production-like environment */
+const isProduction = process.env.NODE_ENV === 'production';
+
+/** Helper to set the refresh token httpOnly cookie */
+function setRefreshCookie(res: Response, rawToken: string) {
+  res.cookie(REFRESH_COOKIE, rawToken, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
+    path: '/members/auth/refresh',
+    maxAge: REFRESH_TOKEN_EXPIRY_SECS * 1000,
+  });
+}
+
+/** Helper to clear the refresh token cookie */
+function clearRefreshCookie(res: Response) {
+  res.clearCookie(REFRESH_COOKIE, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
+    path: '/members/auth/refresh',
+  });
+}
 
 const router = Router();
 
@@ -127,16 +173,29 @@ router.post('/verify-otp', async (req: AuthenticatedRequest, res: Response) => {
       }
     }
 
-    // 5. Sign JWT token
-    const secret = getJwtSecret();
-    const token = jwt.sign(
+    // 5. Sign short-lived access token (5 min)
+    const accessToken = jwt.sign(
       { memberId: member.id, whatsappNumber: member.whatsappNumber },
-      secret,
-      { algorithm: 'HS256', expiresIn: '30d' }
+      getJwtSecret(),
+      { algorithm: 'HS256', expiresIn: ACCESS_TOKEN_EXPIRY }
     );
 
+    // 6. Sign refresh token (30 days) and store its hash in the DB
+    const rawRefreshToken = jwt.sign(
+      { memberId: member.id, sub: 'refresh' },
+      getRefreshSecret(),
+      { algorithm: 'HS256', expiresIn: REFRESH_TOKEN_EXPIRY_JWT }
+    );
+    await prisma.member.update({
+      where: { id: member.id },
+      data: { refreshToken: hashToken(rawRefreshToken) }
+    });
+
+    // 7. Set refresh token in httpOnly cookie (not accessible via JS)
+    setRefreshCookie(res, rawRefreshToken);
+
     res.status(200).json({
-      token,
+      access_token: accessToken,
       member: {
         id: member.id,
         whatsappNumber: member.whatsappNumber,
@@ -146,6 +205,118 @@ router.post('/verify-otp', async (req: AuthenticatedRequest, res: Response) => {
     });
   } catch (error: any) {
     console.error('Error in verify-otp:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /members/auth/refresh - Silent session restore via httpOnly cookie
+router.get('/auth/refresh', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const rawToken: string | undefined = req.cookies?.[REFRESH_COOKIE];
+    if (!rawToken) {
+      res.status(401).json({ error: 'No refresh token' });
+      return;
+    }
+
+    // 1. Verify the refresh token JWT
+    let payload: { memberId: string; sub: string };
+    try {
+      payload = jwt.verify(rawToken, getRefreshSecret(), { algorithms: ['HS256'] }) as {
+        memberId: string;
+        sub: string;
+      };
+    } catch {
+      clearRefreshCookie(res);
+      res.status(401).json({ error: 'Invalid or expired refresh token' });
+      return;
+    }
+
+    if (payload.sub !== 'refresh') {
+      clearRefreshCookie(res);
+      res.status(401).json({ error: 'Invalid token type' });
+      return;
+    }
+
+    // 2. Load member and compare the stored hash in constant time
+    const member = await prisma.member.findUnique({
+      where: { id: payload.memberId },
+      select: { id: true, whatsappNumber: true, alertsEnabled: true, joinedAt: true, refreshToken: true },
+    });
+    if (!member || !member.refreshToken) {
+      clearRefreshCookie(res);
+      res.status(401).json({ error: 'Session revoked' });
+      return;
+    }
+
+    if (!safeCompare(hashToken(rawToken), member.refreshToken)) {
+      // Token does not match — possible theft; revoke all
+      await prisma.member.update({ where: { id: member.id }, data: { refreshToken: null } });
+      clearRefreshCookie(res);
+      res.status(401).json({ error: 'Session revoked' });
+      return;
+    }
+
+    // 3. Rotate: issue new access + refresh token pair
+    const newAccessToken = jwt.sign(
+      { memberId: member.id, whatsappNumber: member.whatsappNumber },
+      getJwtSecret(),
+      { algorithm: 'HS256', expiresIn: ACCESS_TOKEN_EXPIRY }
+    );
+    const newRawRefreshToken = jwt.sign(
+      { memberId: member.id, sub: 'refresh' },
+      getRefreshSecret(),
+      { algorithm: 'HS256', expiresIn: REFRESH_TOKEN_EXPIRY_JWT }
+    );
+    await prisma.member.update({
+      where: { id: member.id },
+      data: { refreshToken: hashToken(newRawRefreshToken) }
+    });
+    setRefreshCookie(res, newRawRefreshToken);
+
+    res.status(200).json({
+      access_token: newAccessToken,
+      member: {
+        id: member.id,
+        whatsappNumber: member.whatsappNumber,
+        alertsEnabled: member.alertsEnabled,
+        joinedAt: member.joinedAt
+      }
+    });
+  } catch (error: any) {
+    console.error('Error in /auth/refresh:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /members/auth/logout - Revoke refresh token and clear cookie
+router.post('/auth/logout', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    await prisma.member.update({
+      where: { id: req.user!.memberId },
+      data: { refreshToken: null }
+    });
+    clearRefreshCookie(res);
+    res.status(200).json({ message: 'Logged out successfully' });
+  } catch (error: any) {
+    console.error('Error in /auth/logout:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /members/me - Return authenticated member's profile
+router.get('/me', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const member = await prisma.member.findUnique({
+      where: { id: req.user!.memberId },
+      select: { id: true, whatsappNumber: true, alertsEnabled: true, fcmToken: true, joinedAt: true }
+    });
+    if (!member) {
+      res.status(404).json({ error: 'Member not found' });
+      return;
+    }
+    res.json({ member });
+  } catch (error: any) {
+    console.error('Error in /me:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
