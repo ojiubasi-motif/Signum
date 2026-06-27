@@ -14,7 +14,14 @@ import { formatWhatsappNumber, formatPrice } from '../utils/formatter';
 import { setWhatsappSocket } from '../services/whatsapp';
 import { sendPushNotification } from '../services/fcm';
 import { processReviewDecision } from '../services/db';
+import { getMenu } from '../services/botCommands';
 import pino from 'pino';
+
+/**
+ * In-memory set of member phone numbers greeted this session.
+ * Cleared on bot restart — first DM after restart always gets the menu.
+ */
+const greetedNumbers = new Set<string>();
 
 // Helper to resolve an incoming JID to its canonical admin JID if it matches
 function getCanonicalAdminJid(jid: string): string {
@@ -230,6 +237,12 @@ export async function startBot() {
 
         console.log(`💬 Member DM from ${readableNumber}: "${text}"`);
         try {
+          // Auto-send the menu on the very first DM from this member this session
+          if (!greetedNumbers.has(readableNumber)) {
+            greetedNumbers.add(readableNumber);
+            await sock.sendMessage(remoteJid, { text: getMenu() });
+          }
+
           const reply = await processMemberMessage(readableNumber, text);
           await sock.sendMessage(remoteJid, { text: reply });
         } catch (err: any) {

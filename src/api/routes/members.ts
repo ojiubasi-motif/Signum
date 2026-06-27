@@ -8,6 +8,15 @@ import { redisConnection } from '../../config/redis';
 import { sendWhatsappMessage } from '../../services/whatsapp';
 import { ADMIN_NUMBERS } from '../../config/constants';
 import crypto from 'crypto';
+import {
+  getMenu,
+  getPriceCommand,
+  getCalcCommand,
+  getPnlCommand,
+  getActiveSignals,
+  getOpenSignals,
+  getSignalHistory,
+} from '../../services/botCommands';
 
 /** Access token lifetime: 5 minutes */
 const ACCESS_TOKEN_EXPIRY = '5m';
@@ -540,6 +549,84 @@ router.put('/preferences', authenticateJWT, async (req: AuthenticatedRequest, re
     });
   } catch (error: any) {
     console.error('Error updating preferences:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /members/bot/query (Authenticated) — Client bot dialog command handler
+// Security: authenticateJWT required; cmd allow-listed; all inputs validated
+router.get('/bot/query', authenticateJWT, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const ALLOWED_CMDS = ['menu', 'price', 'calc', 'pnl', 'active', 'open', 'history'] as const;
+    type Cmd = typeof ALLOWED_CMDS[number];
+
+    const cmd = (req.query.cmd as string | undefined)?.trim().toLowerCase() as Cmd | undefined;
+
+    if (!cmd || !(ALLOWED_CMDS as readonly string[]).includes(cmd)) {
+      res.status(400).json({ error: `Invalid command. Allowed: ${ALLOWED_CMDS.join(', ')}` });
+      return;
+    }
+
+    let result: string;
+
+    switch (cmd) {
+      case 'menu':
+        result = getMenu();
+        break;
+
+      case 'price': {
+        const sym = (req.query.sym as string | undefined)?.trim() ?? '';
+        if (!sym) {
+          res.status(400).json({ error: 'sym query param is required for price command' });
+          return;
+        }
+        result = await getPriceCommand(sym);
+        break;
+      }
+
+      case 'calc': {
+        const entry = (req.query.entry as string | undefined)?.trim() ?? '';
+        const tp = (req.query.tp as string | undefined)?.trim() ?? '';
+        const sl = (req.query.sl as string | undefined)?.trim() ?? '';
+        if (!entry || !tp || !sl) {
+          res.status(400).json({ error: 'entry, tp, and sl query params are required for calc command' });
+          return;
+        }
+        result = getCalcCommand(entry, tp, sl);
+        break;
+      }
+
+      case 'pnl': {
+        const capital = (req.query.capital as string | undefined)?.trim() ?? '';
+        const pct = (req.query.pct as string | undefined)?.trim() ?? '';
+        if (!capital || !pct) {
+          res.status(400).json({ error: 'capital and pct query params are required for pnl command' });
+          return;
+        }
+        result = getPnlCommand(capital, pct);
+        break;
+      }
+
+      case 'active':
+        result = await getActiveSignals();
+        break;
+
+      case 'open':
+        result = await getOpenSignals();
+        break;
+
+      case 'history':
+        result = await getSignalHistory();
+        break;
+
+      default:
+        res.status(400).json({ error: 'Unknown command' });
+        return;
+    }
+
+    res.json({ result });
+  } catch (error: any) {
+    console.error('Error in /bot/query:', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
