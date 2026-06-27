@@ -1,7 +1,7 @@
 import { prisma } from '../db/src/index';
 import { getLivePrice, setMockPrice } from '../services/binance';
 import { getCachedResolvedSignals } from '../services/cache';
-import { formatWhatsappNumber } from '../utils/formatter';
+import { formatWhatsappNumber, formatPrice } from '../utils/formatter';
 import Groq from 'groq-sdk';
 
 let groqInstance: Groq | null = null;
@@ -46,9 +46,9 @@ export async function processMemberMessage(from: string, text: string): Promise<
       .map(
         s =>
           `*${s.asset}* (${s.direction})\n` +
-          `├─ Entry Zone: $${s.entryMin} – $${s.entryMax}\n` +
-          `├─ Take Profit: $${s.tpPrice} (+${s.tpPercent}%)\n` +
-          `├─ Stop Loss: $${s.slPrice} (-${s.slPercent}%)\n` +
+          `├─ Entry Zone: $${formatPrice(s.entryMin)} – $${formatPrice(s.entryMax)}\n` +
+          `├─ Take Profit: $${formatPrice(s.tpPrice)} (+${s.tpPercent}%)\n` +
+          `├─ Stop Loss: $${formatPrice(s.slPrice)} (-${s.slPercent}%)\n` +
           `├─ Risk/Reward Ratio: 1:${s.rrRatio.toFixed(2)}\n` +
           `└─ Posted By: Admin *${s.admin.name === s.admin.id.split('@')[0] ? formatWhatsappNumber(s.admin.id) : s.admin.name}*`
       )
@@ -70,9 +70,9 @@ export async function processMemberMessage(from: string, text: string): Promise<
         s =>
           `*${s.asset}* (${s.direction})\n` +
           `├─ Status: *${s.status}*\n` +
-          `├─ Entry Zone: $${s.entryMin} – $${s.entryMax}\n` +
-          `├─ Target TP Price: $${s.tpPrice} (+${s.tpPercent}%)\n` +
-          `├─ Triggered SL Price: $${s.slPrice} (-${s.slPercent}%)\n` +
+          `├─ Entry Zone: $${formatPrice(s.entryMin)} – $${formatPrice(s.entryMax)}\n` +
+          `├─ Target TP Price: $${formatPrice(s.tpPrice)} (+${s.tpPercent}%)\n` +
+          `├─ Triggered SL Price: $${formatPrice(s.slPrice)} (-${s.slPercent}%)\n` +
           `└─ Resolved At: ${new Date(s.resolvedAt).toLocaleString()}`
       )
       .join('\n\n');
@@ -115,7 +115,7 @@ export async function processMemberMessage(from: string, text: string): Promise<
       return `❌ *Signum Alert*: Invalid price value.`;
     }
     setMockPrice(assetName, priceValue);
-    return `✅ *Mock Price Set*: Live price for *${assetName}* is now stubbed at **$${priceValue}**.`;
+    return `✅ *Mock Price Set*: Live price for *${assetName}* is now stubbed at **$${formatPrice(priceValue)}**.`;
   }
 
   // 3. LOG MEMBER TRADE
@@ -175,9 +175,9 @@ export async function processMemberMessage(from: string, text: string): Promise<
       `✅ *Trade Registered!* 🚀\n\n` +
       `You are now tracking the latest *${assetName}* signal:\n` +
       `├─ Direction: ${signal.direction}\n` +
-      `├─ Entry Range: $${signal.entryMin} – $${signal.entryMax}\n` +
-      `├─ TP Target: $${signal.tpPrice}\n` +
-      `└─ SL Level: $${signal.slPrice}\n\n` +
+      `├─ Entry Range: $${formatPrice(signal.entryMin)} – $${formatPrice(signal.entryMax)}\n` +
+      `├─ TP Target: $${formatPrice(signal.tpPrice)}\n` +
+      `└─ SL Level: $${formatPrice(signal.slPrice)}\n\n` +
       `We will notify you here once the take-profit or stop-loss hits!`
     );
   }

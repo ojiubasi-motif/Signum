@@ -1,7 +1,7 @@
 import { prisma } from '../db/src/index';
 import { cacheResolvedSignal } from './cache';
-import { formatWhatsappNumber } from '../utils/formatter';
-import { resolveCoingeckoId, getOrUpdateCoinList } from './coingecko';
+import { formatWhatsappNumber, formatPrice } from '../utils/formatter';
+import { resolveCoingeckoId, getOrUpdateCoinList, searchDexPool } from './coingecko';
 import { sendWhatsappMessage } from './whatsapp';
 import { sendPushNotification } from './fcm';
 
@@ -104,6 +104,36 @@ export async function saveSignalToDB(input: {
     }
   }
 
+  // --- DEX Pool fallback when no CoinGecko ID was resolved ---
+  let poolNetwork: string | null = null;
+  let poolAddress: string | null = null;
+  let tokenAddress: string | null = null;
+  let marketUnavailable = false;
+
+  if (!coingeckoId && !pendingCoingecko) {
+    try {
+      const pool = await searchDexPool(input.asset);
+      if (pool) {
+        poolNetwork = pool.network;
+        poolAddress = pool.poolAddress;
+        tokenAddress = pool.tokenAddress;
+        console.log(`🔗 db: DEX pool resolved for ${input.asset}: ${poolNetwork.toUpperCase()} pool ${poolAddress}`);
+      } else {
+        // No CoinGecko ID AND no DEX pool found — market data is unavailable
+        marketUnavailable = true;
+        console.warn(`⚠️ db: No CoinGecko ID or DEX pool found for ${input.asset}. Marking as market unavailable.`);
+
+        // Notify admin via WhatsApp
+        const alertMsg = `⚠️ *Market Data Unavailable*\n\nCoin market data for *${input.asset.toUpperCase()}* is not available on CoinGecko.\nMonitor the market manually for signal tracking.`;
+        await sendWhatsappMessage(adminId, alertMsg).catch(err => {
+          console.error(`❌ db: Failed to send market unavailable alert for ${input.asset}:`, err.message);
+        });
+      }
+    } catch (poolErr: any) {
+      console.error(`❌ db: Failed to search DEX pools for ${input.asset}:`, poolErr.message);
+    }
+  }
+
   const signal = await prisma.signal.create({
     data: {
       messageId: input.messageId || null,
@@ -122,6 +152,10 @@ export async function saveSignalToDB(input: {
       status: pendingCoingecko ? 'PENDING' : 'ENTRY_OPEN',
       livePriceAtPost: input.livePriceAtPost || null,
       coingeckoId,
+      poolNetwork,
+      poolAddress,
+      tokenAddress,
+      marketUnavailable,
       enrichment: pendingCoingecko ? { coingeckoCandidates: candidates } : undefined,
     },
   });
@@ -186,7 +220,7 @@ export async function processAdminCoingeckoChoice(
     });
 
     // Send member notification alert
-    const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+    const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${formatPrice(pendingSignal.entryMin)}-${formatPrice(pendingSignal.entryMax)}`;
     await sendPushNotification({
       signalId: pendingSignal.id,
       urgencyScore: pendingSignal.urgencyScore,
@@ -369,9 +403,9 @@ export async function flagSignalForReview(input: {
     `⚠️ *Signal Flagged for Review* (Confidence: ${input.confidence}%)\n\n` +
     `I'm not fully confident about this parsed signal:\n` +
     `• *Asset*: ${input.asset.toUpperCase()} (${input.direction})\n` +
-    `• *Entry*: $${input.entryMin} – $${input.entryMax}\n` +
-    `• *TP*: $${input.tpPrice} (+${input.tpPercent}%)\n` +
-    `• *SL*: $${input.slPrice} (-${input.slPercent}%)\n` +
+    `• *Entry*: $${formatPrice(input.entryMin)} – $${formatPrice(input.entryMax)}\n` +
+    `• *TP*: $${formatPrice(input.tpPrice)} (+${input.tpPercent}%)\n` +
+    `• *SL*: $${formatPrice(input.slPrice)} (-${input.slPercent}%)\n` +
     `• *R:R*: 1:${input.rrRatio}\n\n` +
     `📝 *Reason*: ${input.reason}\n\n` +
     `Reply *approve* to activate this signal and notify members, or *reject* to discard it.`;
@@ -420,7 +454,7 @@ export async function processReviewDecision(
     });
 
     // Notify members now that admin approved
-    const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+    const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${formatPrice(pendingSignal.entryMin)}-${formatPrice(pendingSignal.entryMax)}`;
     await sendPushNotification({
       signalId: pendingSignal.id,
       urgencyScore: pendingSignal.urgencyScore,

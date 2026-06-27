@@ -175,10 +175,165 @@ export async function resolveCoingeckoId(
       }
     }
 
+    if (!matchedId) {
+      console.warn(`⚠️ CoinGecko: No candidate for symbol "${symbol}" matched the price range $${entryMin}-$${entryMax}`);
+    }
+
     return matchedId;
 
   } catch (error: any) {
     console.error(`❌ CoinGecko: Error resolving ID for "${symbol}":`, error.message);
+    return null;
+  }
+}
+
+/* ─── DEX Pool Fallback ────────────────────────────────────────────── */
+
+/** Allowed DEX networks — allowlist prevents SSRF via injection */
+const ALLOWED_NETWORKS = ['eth', 'bsc', 'solana'] as const;
+type DexNetwork = typeof ALLOWED_NETWORKS[number];
+
+/** Network priority for pool selection (highest liquidity first) */
+const NETWORK_PRIORITY: Record<DexNetwork, number> = { eth: 0, bsc: 1, solana: 2 };
+
+export interface DexPoolResult {
+  network: DexNetwork;
+  poolAddress: string;
+  tokenAddress: string;
+}
+
+/**
+ * Searches GeckoTerminal for DEX pools containing the given token symbol.
+ * Validates all data before use (SSRF prevention, input validation).
+ * Returns the best pool ranked by network priority then FDV.
+ */
+export async function searchDexPool(symbol: string): Promise<DexPoolResult | null> {
+  const cleanSymbol = symbol.trim().toLowerCase();
+
+  // Input validation: only alphanumeric, hyphen, underscore (OWASP allow-list)
+  if (!/^[a-z0-9_\-]+$/.test(cleanSymbol)) {
+    console.warn(`⚠️ CoinGecko: Invalid symbol rejected for pool search: "${cleanSymbol}"`);
+    return null;
+  }
+
+  const apiKey = process.env.COINGECKO_API_KEY || '';
+  const isDemo = apiKey.startsWith('CG-');
+  const baseUrl = isDemo || !apiKey
+    ? 'https://api.coingecko.com/api/v3'
+    : 'https://pro-api.coingecko.com/api/v3';
+  const headerName = isDemo ? 'x-cg-demo-api-key' : 'x-cg-pro-api-key';
+  const headers: Record<string, string> = {};
+  if (apiKey) {
+    headers[headerName] = apiKey;
+  }
+
+  try {
+    console.log(`🔍 CoinGecko: Searching DEX pools for symbol "${symbol}"...`);
+    const url = `${baseUrl}/onchain/search/pools?query=${encodeURIComponent(cleanSymbol)}&include=base_token&page=1`;
+    const response = await secureFetch(url, { headers });
+
+    if (!response.ok) {
+      console.warn(`⚠️ CoinGecko: Pool search returned ${response.status} for "${symbol}"`);
+      return null;
+    }
+
+    const json = (await response.json()) as {
+      data: Array<{
+        attributes: { address: string; fdv_usd: number | null; name: string };
+        relationships: { base_token: { data: { id: string } } };
+      }>;
+      included: Array<{
+        type: string;
+        id: string;
+        attributes: { symbol: string; address: string };
+      }>;
+    };
+
+    if (!Array.isArray(json.data) || json.data.length === 0) {
+      console.warn(`⚠️ CoinGecko: No DEX pools found for symbol "${symbol}"`);
+      return null;
+    }
+
+    // Build a lookup of included base_tokens by their composite ID
+    const includedTokenSymbols = new Map<string, string>();
+    for (const item of json.included ?? []) {
+      if (item.type === 'token') {
+        includedTokenSymbols.set(item.id, item.attributes?.symbol?.toLowerCase() ?? '');
+      }
+    }
+
+    // Validate and score each pool
+    const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+    const SOL_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+    interface ScoredPool {
+      network: DexNetwork;
+      poolAddress: string;
+      tokenAddress: string;
+      fdv: number;
+      priority: number;
+    }
+
+    const validPools: ScoredPool[] = [];
+
+    for (const pool of json.data) {
+      const baseTokenId: string = pool.relationships?.base_token?.data?.id ?? '';
+      if (!baseTokenId) continue;
+
+      // Extract network and token address from composite ID "{network}_{address}"
+      const underscoreIdx = baseTokenId.indexOf('_');
+      if (underscoreIdx === -1) continue;
+      const rawNetwork = baseTokenId.slice(0, underscoreIdx);
+      const tokenAddress = baseTokenId.slice(underscoreIdx + 1);
+      const poolAddress = pool.attributes?.address ?? '';
+
+      // Validate network against allowlist
+      if (!(ALLOWED_NETWORKS as readonly string[]).includes(rawNetwork)) continue;
+      const network = rawNetwork as DexNetwork;
+
+      // Validate token symbol matches searched symbol (prevent false positives)
+      const baseTokenSymbol = includedTokenSymbols.get(baseTokenId) ?? '';
+      if (baseTokenSymbol !== cleanSymbol) continue;
+
+      // Validate addresses by network type
+      if (network === 'solana') {
+        if (!SOL_ADDRESS_RE.test(poolAddress) || !SOL_ADDRESS_RE.test(tokenAddress)) {
+          console.warn(`⚠️ CoinGecko: Invalid Solana address for pool "${poolAddress}" — skipped`);
+          continue;
+        }
+      } else {
+        if (!EVM_ADDRESS_RE.test(poolAddress) || !EVM_ADDRESS_RE.test(tokenAddress)) {
+          console.warn(`⚠️ CoinGecko: Invalid EVM address for pool "${poolAddress}" — skipped`);
+          continue;
+        }
+      }
+
+      validPools.push({
+        network,
+        poolAddress,
+        tokenAddress,
+        fdv: pool.attributes?.fdv_usd ?? 0,
+        priority: NETWORK_PRIORITY[network],
+      });
+    }
+
+    if (validPools.length === 0) {
+      console.warn(`⚠️ CoinGecko: No valid DEX pools with matching symbol found for "${symbol}"`);
+      return null;
+    }
+
+    // Rank: first by network priority (eth < bsc < solana), then by FDV descending
+    validPools.sort((a, b) => a.priority - b.priority || b.fdv - a.fdv);
+    const best = validPools[0];
+
+    console.log(
+      `🎯 CoinGecko: Best pool for "${symbol}" — ${best.network.toUpperCase()} pool ${best.poolAddress} (FDV $${best.fdv?.toFixed(0) ?? '?'})`
+    );
+
+    return { network: best.network, poolAddress: best.poolAddress, tokenAddress: best.tokenAddress };
+
+  } catch (error: any) {
+    console.error(`❌ CoinGecko: Error searching DEX pools for "${symbol}":`, error.message);
     return null;
   }
 }

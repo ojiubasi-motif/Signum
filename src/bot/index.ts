@@ -10,7 +10,7 @@ import { prisma } from '../db/src/index';
 import { ADMIN_NUMBERS, TARGET_GROUP_ID } from '../config/constants';
 import { processMemberMessage } from './memberInterface';
 import { syncGroupParticipants } from '../services/groupSync';
-import { formatWhatsappNumber } from '../utils/formatter';
+import { formatWhatsappNumber, formatPrice } from '../utils/formatter';
 import { setWhatsappSocket } from '../services/whatsapp';
 import { sendPushNotification } from '../services/fcm';
 import { processReviewDecision } from '../services/db';
@@ -178,7 +178,7 @@ export async function startBot() {
                   });
 
                   // Send member notification alert
-                  const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${pendingSignal.entryMin}-${pendingSignal.entryMax}`;
+                  const alertMsg = `🚀 *NEW SIGNAL*: ${pendingSignal.direction} ${pendingSignal.asset} at ${formatPrice(pendingSignal.entryMin)}-${formatPrice(pendingSignal.entryMax)}`;
                   await sendPushNotification({
                     signalId: pendingSignal.id,
                     urgencyScore: pendingSignal.urgencyScore,

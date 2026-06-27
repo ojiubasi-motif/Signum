@@ -1,6 +1,8 @@
 import { prisma } from '../db/src/index';
 import { getLiveOHLC } from '../services/binance';
 import { sendPushNotification } from '../services/fcm';
+import { sendWhatsappMessage } from '../services/whatsapp';
+import { formatPrice } from '../utils/formatter';
 import { ADMIN_NUMBERS } from '../config/constants';
 import { updateStatus } from '../services/db';
 
@@ -39,11 +41,16 @@ export async function checkPricesOnce() {
       const asset = signals[0].asset;
       const coingeckoId = signals[0].coingeckoId;
 
-      let candles = await getLiveOHLC(asset, coingeckoId);
+      let candles = await getLiveOHLC(asset, coingeckoId, signals[0].poolNetwork, signals[0].poolAddress);
       if (!candles || candles.length === 0) {
         console.warn(`⚠️ Price Watcher: Could not fetch OHLC data for ${asset} (group: ${groupKey})`);
         continue;
       }
+
+      // Infer candle interval from consecutive timestamps (robust for 15-min and 30-min series)
+      const candleIntervalMs = candles.length >= 2
+        ? candles[1][0] - candles[0][0]
+        : 15 * 60 * 1000;
 
       let latestCandle = candles[candles.length - 1];
       let [timestamp, open, high, low, close] = latestCandle;
@@ -60,10 +67,10 @@ export async function checkPricesOnce() {
         
         while (!isFresh && attempt < maxRetries) {
           attempt++;
-          console.log(`⏳ Price Watcher: ${asset} (${groupKey}) data is stale (timestamp: ${timestamp}). Retrying in ${retryDelayMs / 1000}s (Attempt ${attempt}/${maxRetries})...`);
+          console.log(`⏳ Price Watcher: ${asset} (${groupKey}) CoinGecko cache not yet rolled over (last candle: ${new Date(timestamp).toISOString()}). Retrying in ${retryDelayMs / 1000}s (Attempt ${attempt}/${maxRetries})...`);
           await new Promise(resolve => setTimeout(resolve, retryDelayMs));
           
-          candles = await getLiveOHLC(asset, coingeckoId);
+          candles = await getLiveOHLC(asset, coingeckoId, signals[0].poolNetwork, signals[0].poolAddress);
           if (candles && candles.length > 0) {
             latestCandle = candles[candles.length - 1];
             [timestamp, open, high, low, close] = latestCandle;
@@ -83,22 +90,48 @@ export async function checkPricesOnce() {
 
       console.log(
         `📈 Price Watcher: ${asset} (${groupKey}) OHLC Candle Close Time = ${new Date(timestamp).toLocaleTimeString()} ` +
-        `| High = ${high} | Low = ${low} | Fresh = ${isFresh || isTest}`
+        `| High = ${formatPrice(high)} | Low = ${formatPrice(low)} | Fresh = ${isFresh || isTest}`
       );
 
       for (const signal of signals) {
-        // Flag data as stale if the candle close time is less than 30 minutes younger than when the signal was dropped
-        const minCandleCloseTime = signal.createdAt.getTime() + 30 * 60 * 1000;
-        if (timestamp < minCandleCloseTime) {
+        // A candle is only valid for a signal if its OPEN time is >= the signal drop time.
+        // Both CoinGecko and GeckoTerminal return CLOSE timestamps, so:
+        //   candleOpenTime = timestamp - candleIntervalMs
+        //
+        // Example: signal dropped at 8:29, candle closes at 8:30 (opens at 8:15).
+        //   candleOpenTime (8:15) < signalDropTime (8:29) → INVALID, skip.
+        //   The 8:45 candle (opens at 8:30) would be the first valid one.
+        const candleOpenTime = timestamp - candleIntervalMs;
+        const signalDropTime = signal.createdAt.getTime();
+
+        if (candleOpenTime < signalDropTime) {
           console.warn(
-            `⚠️ Price Watcher: Candle close time (${new Date(timestamp).toISOString()}) for ${asset} ` +
-            `is less than 30-min ahead of signal drop time (${signal.createdAt.toISOString()}). Data is stale for signal ${signal.id}. Skipping.`
+            `⚠️ Price Watcher: Candle [${new Date(candleOpenTime).toISOString()} → ${new Date(timestamp).toISOString()}] for ${asset} ` +
+            `opened before signal drop (${signal.createdAt.toISOString()}). ` +
+            `Waiting for next candle for signal ${signal.id}.`
           );
+
+          // Only alert admin if this is a DEX-pool-only asset (no coingeckoId)
+          // with no usable data — indicates the pool may be inactive.
+          if (!signal.coingeckoId && !signal.marketUnavailable) {
+            await prisma.signal.update({
+              where: { id: signal.id },
+              data: { marketUnavailable: true },
+            }).catch(err => {
+              console.error(`❌ Price Watcher: Failed to update marketUnavailable for signal ${signal.id}:`, err.message);
+            });
+            signal.marketUnavailable = true;
+
+            const alertMsg = `⚠️ *Market Data Inactive*\n\nNo recent trades found for *${asset.toUpperCase()}* on GeckoTerminal (last data: ${new Date(timestamp).toISOString()}).\nMonitor the market manually for signal tracking.`;
+            await sendWhatsappMessage(signal.adminId, alertMsg).catch(err => {
+              console.error(`❌ Price Watcher: Failed to send inactive alert for ${asset}:`, err.message);
+            });
+          }
           continue;
         }
 
         console.log(
-          `🔍 Price Watcher: Evaluating signal ${signal.id} for ${asset} | TP = ${signal.tpPrice} | SL = ${signal.slPrice}`
+          `🔍 Price Watcher: Evaluating signal ${signal.id} for ${asset} | TP = ${formatPrice(signal.tpPrice)} | SL = ${formatPrice(signal.slPrice)}`
         );
 
         let hitTp = false;
@@ -124,7 +157,7 @@ export async function checkPricesOnce() {
         }
 
         if (hitTp) {
-          console.log(`🎯 Price Watcher: TP hit for signal ${signal.id} (${signal.asset} at target price of ${hitPrice})`);
+          console.log(`🎯 Price Watcher: TP hit for signal ${signal.id} (${signal.asset} at target price of ${formatPrice(hitPrice)})`);
           await updateStatus(signal.id, 'TP_HIT');
 
           await sendPushNotification({
@@ -133,7 +166,7 @@ export async function checkPricesOnce() {
             message: `🎯 ${signal.asset} Take Profit Hit! Target of +${signal.tpPercent}% reached.`,
           });
         } else if (hitSl) {
-          console.log(`🔴 Price Watcher: SL hit for signal ${signal.id} (${signal.asset} at stop price of ${hitPrice})`);
+          console.log(`🔴 Price Watcher: SL hit for signal ${signal.id} (${signal.asset} at stop price of ${formatPrice(hitPrice)})`);
           await updateStatus(signal.id, 'SL_HIT');
 
           await sendPushNotification({

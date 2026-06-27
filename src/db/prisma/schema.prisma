@@ -38,6 +38,10 @@ model Signal {
   livePriceAtPost Float?                // price when signal was posted
   resolvedAt      DateTime?
   coingeckoId     String?
+  poolNetwork     String?   // e.g. "eth", "bsc", "solana" — set when coin not on CoinGecko
+  poolAddress     String?   // DEX pool contract/account address for OHLCV fallback
+  tokenAddress    String?   // Base token address extracted from pool search
+  marketUnavailable Boolean @default(false) // true when no CoinGecko or DEX data found
   createdAt       DateTime  @default(now())
 
   admin           Admin     @relation(fields:[adminId], references:[id])

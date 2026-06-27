@@ -60,3 +60,28 @@ export function formatWhatsappNumber(jid: string): string {
 
   return cleanNumber;
 }
+
+/**
+ * Formats a price value to exactly 4 significant figures, avoiding scientific notation
+ * for display purposes (especially for high-value or low-value/micro-cap tokens).
+ */
+export function formatPrice(price: number | null | undefined): string {
+  if (price === null || price === undefined) return '';
+  if (price === 0) return '0.0000';
+  
+  const sigStr = price.toPrecision(4);
+  if (!sigStr.includes('e')) {
+    return sigStr;
+  }
+  
+  const val = Number(sigStr);
+  const exponent = parseInt(sigStr.split('e')[1], 10);
+  
+  if (Math.abs(val) >= 1) {
+    const decimals = Math.max(0, 3 - exponent);
+    return val.toFixed(decimals);
+  }
+  
+  const decimals = 3 - exponent;
+  return val.toFixed(decimals);
+}
